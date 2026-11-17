@@ -16,6 +16,8 @@ jobs:
           target: x86_64-pc-windows-gnu
       - name: Install dependencies without native packages
         run: npm install --omit=optional --ignore-scripts
+      - name: Install frontend dependencies
+        run: npm --prefix quorfloat/frontend ci --ignore-scripts
       - name: Build Windows package
         run: npm run build:npm -- --target x86_64-pc-windows-gnu
       - name: Upload package
