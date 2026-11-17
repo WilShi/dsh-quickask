@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: rust-lang/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           target: x86_64-pc-windows-gnu
       - name: Install dependencies without native packages
