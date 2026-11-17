@@ -323,7 +323,7 @@ const DETAIL_ORDER = 20
  * as `pkg.name`, the row as `row.moduleName`, because the bundle's patch
  * (`cordis.patch.yml`) names the row after the package.
  */
-const BUNDLE_NAME = 'dsh-quickask'
+const BUNDLE_NAME = '@wilshi/dsh-quickask'
 
 /**
  * Whether the open detail page is this plugin's.

@@ -1,6 +1,6 @@
 # dsh-quickask
 
-[简体中文](README.md) | English | [npm](https://www.npmjs.com/package/dsh-quickask)
+[简体中文](README.md) | English | [npm](https://www.npmjs.com/package/@wilshi/dsh-quickask)
 
 A floating desktop chat plugin for DeepSeek Harness. Bring up the panel with a global keyboard shortcut to ask Harness questions, continue existing sessions, read responses, and handle approvals while using other applications.
 
@@ -32,7 +32,7 @@ The panel uses Harness's workspaces, sessions, models, and permission settings. 
 
 Install DeepSeek Harness. If you use the browser WebUI, also make sure the `dsh` command is available in your terminal.
 
-The main npm package is **`dsh-quickask`**. Install only this package; platform dependencies are installed automatically.
+The main npm package is **`@wilshi/dsh-quickask`**. Install only this package; platform dependencies are installed automatically.
 
 For offline installation, download the self-contained tgz for your operating system and the current release, for example:
 
@@ -52,7 +52,7 @@ When accessed remotely, the WebUI can install the plugin and show its status, bu
 Install the latest version with an internet connection:
 
 ```bash
-dsh plugin --profile web add dsh-quickask
+dsh plugin --profile web add @wilshi/dsh-quickask
 dsh web
 ```
 
@@ -82,7 +82,7 @@ Launch the desktop app, open “Plugins” in the left sidebar, and click “Add
 
 #### npm installation
 
-1. Click “Plugins” → “Add Plugin” in the left sidebar. Enter **`dsh-quickask`** in the Add Plugin dialog, or **`dsh-quickask@<version>`** for a specific version.
+1. Click “Plugins” → “Add Plugin” in the left sidebar. Enter **`@wilshi/dsh-quickask`** in the Add Plugin dialog, or **`dsh-quickask@<version>`** for a specific version.
 2. Click Install. If prompted to enable the plugin, follow the prompt. The package manager automatically installs the panel application for your platform.
 3. Fully quit and restart the Harness desktop app.
 

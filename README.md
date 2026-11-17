@@ -1,6 +1,6 @@
 # dsh-quickask
 
-简体中文 | [English](README_EN.md) | [npm](https://www.npmjs.com/package/dsh-quickask)
+简体中文 | [English](README_EN.md) | [npm](https://www.npmjs.com/package/@wilshi/dsh-quickask)
 
 DeepSeek Harness 的桌面悬浮窗会话插件。通过全局快捷键呼出面板，在使用其他应用时也能向 Harness 提问、继续已有会话、查看回答和处理审批。
 
@@ -32,7 +32,7 @@ DeepSeek Harness 的桌面悬浮窗会话插件。通过全局快捷键呼出面
 
 安装 DeepSeek Harness。使用浏览器 WebUI 时，还需确保终端可以运行 `dsh` 命令。
 
-npm 主包名为 **`dsh-quickask`**，只需安装这个主包，平台依赖会自动安装。
+npm 主包名为 **`@wilshi/dsh-quickask`**，只需安装这个主包，平台依赖会自动安装。
 
 离线安装请下载当前版本对应操作系统的自包含 tgz，例如：
 
@@ -52,7 +52,7 @@ npm 主包名为 **`dsh-quickask`**，只需安装这个主包，平台依赖会
 联网安装最新版本：
 
 ```bash
-dsh plugin --profile web add dsh-quickask
+dsh plugin --profile web add @wilshi/dsh-quickask
 dsh web
 ```
 
@@ -82,7 +82,7 @@ dsh web
 
 #### npm 安装
 
-1. 点击左侧栏 “插件” -> "添加插件"，在添加插件弹窗输入 **`dsh-quickask`**，或指定版本 **`dsh-quickask@<version>`**。
+1. 点击左侧栏 “插件” -> "添加插件"，在添加插件弹窗输入 **`@wilshi/dsh-quickask`**，或指定版本 **`dsh-quickask@<version>`**。
 2. 点击安装；若出现启用提示，按提示启用插件。包管理器会自动安装当前平台的面板程序。
 3. 完全退出并重新启动 Harness 桌面应用。
 

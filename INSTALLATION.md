@@ -2,10 +2,10 @@
 
 ## 当前安装
 
-- 安装位置：`~/.dsh/profiles/desktop/node_modules/dsh-quickask/`
+- 安装位置：`~/.dsh/profiles/desktop/node_modules/@wilshi/dsh-quickask/`
 - 安装包：`bundles/dsh-quickask-0.1.10-darwin.tgz`
 - 默认配置：`window.floatingBall: false`、`window.ballLogo: ""`
-- 原生侧车：`~/.dsh/profiles/desktop/node_modules/dsh-quickask/bin/dsh-quorfloat`
+- 原生侧车：`~/.dsh/profiles/desktop/node_modules/@wilshi/dsh-quickask/bin/dsh-quorfloat`
 
 安装使用 DSH 自带 `dsh plugin --profile desktop add <tgz>`，不是手工替换二进制。
 
