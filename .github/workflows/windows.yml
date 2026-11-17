@@ -1,0 +1,25 @@
+name: Build Windows package
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: rust-lang/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-gnu
+      - name: Install dependencies without native packages
+        run: npm install --omit=optional --ignore-scripts
+      - name: Build Windows package
+        run: npm run build:npm -- --target x86_64-pc-windows-gnu
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-quickask-win32-x64
+          path: bundles/npm/0.2.0/*.tgz
