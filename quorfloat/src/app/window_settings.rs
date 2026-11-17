@@ -1,0 +1,291 @@
+//! The window: how big the panel is, and how it sits among other windows.
+//!
+//! Settings arrive from the environment at startup and can be overridden by the host's
+//! `ready` payload; everything here is the translation of those numbers into what the
+//! shell asks of the platform. Nothing in this file decides *whether* the panel is
+//! visible — that is state, and it lives in the shell's dispatcher (`main.rs`).
+//!
+//! This module is the configuration contract without the viewport builder.
+
+/// Window geometry and appearance, from the host's effective configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSettings {
+    /// Width in logical pixels.
+    pub width: f32,
+    /// Maximum expanded height in logical pixels.
+    pub max_height: f32,
+    /// Keep the panel above other windows.
+    pub always_on_top: bool,
+    /// Suppress animations. The host exposes this because motion sensitivity is a
+    /// user preference, not a per-app choice.
+    pub reduce_motion: bool,
+    /// Which of the design's two palettes to draw in.
+    pub theme: crate::app::theme::Preference,
+    /// Which language the panel's own interface and menu bar speak.
+    ///
+    /// The panel's setting, not the conversation's: the strings this process owns (the tray
+    /// menu) and the copy the frontend owns are drawn from it. The host resolves it before
+    /// the process starts — an explicit panel setting, or the Harness's own locale on the
+    /// very first launch — and the panel's remembered choice sits on top of it like every
+    /// other setting here (see [`Self::with_preferences`]).
+    pub language: crate::app::language::Language,
+    /// Put the panel away when the user moves to another window.
+    ///
+    /// The design's own semantics: the panel is a thing you summon, use, and leave — and a
+    /// panel still sitting over someone else's application after they have gone back to it
+    /// is in the way. Off is a legitimate choice too, so it is a setting, not a rule.
+    pub hide_on_blur: bool,
+    /// Show the independent desktop ball. Disabled unless the user opts in.
+    pub floating_ball: bool,
+    /// Custom image data URL for the ball; empty selects the official DeepSeek logo.
+    pub ball_logo: String,
+    /// Open with the panel already showing.
+    ///
+    /// Off by default and meant for development: it is the difference between "look at the
+    /// panel" and "press the hotkey and then describe what you saw", which is what makes a
+    /// scriptable run possible.
+    pub start_visible: bool,
+    /// Where the panel opens when there is no remembered position to restore.
+    ///
+    /// The default is the centre of the primary work area, as the user prefers. An explicit
+    /// preference also moves an existing panel immediately.
+    pub anchor: crate::app::geometry::Anchor,
+}
+
+impl Default for WindowSettings {
+    fn default() -> Self {
+        // Matches `DEFAULT_CONFIG.window` on the host side. Duplicated rather than
+        // requested so the panel can be shown before the handshake completes; the
+        // host's `ready` payload is the authority once it arrives.
+        Self {
+            // The design's own `max-width:640px`.
+            width: 640.0,
+            max_height: 420.0,
+            always_on_top: true,
+            reduce_motion: false,
+            // A panel that floats over other applications should look like it belongs to
+            // the desktop it is floating over, so the platform decides until told otherwise.
+            theme: crate::app::theme::Preference::System,
+            // The language the tray's own strings are written in; the host overrides this
+            // from the resolved setting, and a standalone run keeps the historical Chinese.
+            language: crate::app::language::Language::default(),
+            hide_on_blur: true,
+            floating_ball: false,
+            ball_logo: String::new(),
+            start_visible: false,
+            // The host's schema default, restated here for the same reason as the numbers above:
+            // the very first frame is placed before `ready` arrives.
+            anchor: crate::app::geometry::Anchor::default(),
+        }
+    }
+}
+
+impl WindowSettings {
+    /// Read overrides from the environment.
+    ///
+    /// The host passes `DSH_QUORFLOAT_WINDOW_*` at spawn time, which is what makes
+    /// the panel the right size on its very first frame instead of resizing once
+    /// the handshake returns.
+    ///
+    /// @returns the settings, falling back to defaults per field.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            width: float_env("DSH_QUORFLOAT_WINDOW_WIDTH", defaults.width),
+            max_height: float_env("DSH_QUORFLOAT_WINDOW_MAX_HEIGHT", defaults.max_height),
+            always_on_top: bool_env("DSH_QUORFLOAT_WINDOW_ALWAYS_ON_TOP", defaults.always_on_top),
+            theme: crate::app::theme::Preference::from_env(),
+            language: crate::app::language::Language::from_env(),
+            hide_on_blur: bool_env("DSH_QUORFLOAT_WINDOW_HIDE_ON_BLUR", defaults.hide_on_blur),
+            floating_ball: bool_env("DSH_QUORFLOAT_WINDOW_FLOATING_BALL", defaults.floating_ball),
+            ball_logo: std::env::var("DSH_QUORFLOAT_WINDOW_BALL_LOGO")
+                .ok()
+                .filter(|logo| crate::app::preferences::valid_ball_logo(logo))
+                .unwrap_or(defaults.ball_logo),
+            start_visible: bool_env("DSH_QUORFLOAT_WINDOW_START_VISIBLE", defaults.start_visible),
+            reduce_motion: bool_env("DSH_QUORFLOAT_WINDOW_REDUCE_MOTION", defaults.reduce_motion),
+            anchor: anchor_env("DSH_QUORFLOAT_WINDOW_ANCHOR", defaults.anchor),
+        }
+    }
+
+    /// Apply the window section of the host's `ready` payload.
+    ///
+    /// @param window - the `config.window` object, if present.
+    pub fn apply_host(&mut self, window: Option<&serde_json::Value>) {
+        let Some(window) = window.and_then(serde_json::Value::as_object) else {
+            return;
+        };
+        if let Some(width) = window.get("width").and_then(serde_json::Value::as_f64) {
+            self.width = width as f32;
+        }
+        if let Some(height) = window.get("maxHeight").and_then(serde_json::Value::as_f64) {
+            self.max_height = height as f32;
+        }
+        if let Some(hide) = window.get("hideOnBlur").and_then(serde_json::Value::as_bool) {
+            self.hide_on_blur = hide;
+        }
+        if let Some(show) = window.get("floatingBall").and_then(serde_json::Value::as_bool) {
+            self.floating_ball = show;
+        }
+        if let Some(logo) = window
+            .get("ballLogo")
+            .and_then(serde_json::Value::as_str)
+            .filter(|logo| crate::app::preferences::valid_ball_logo(logo))
+        {
+            self.ball_logo = logo.to_owned();
+        }
+        if let Some(theme) = window.get("theme").and_then(serde_json::Value::as_str) {
+            self.theme = crate::app::theme::Preference::from_name(Some(theme));
+        }
+        // An unrecognised id keeps the language already in force: this value crosses a
+        // language boundary (`LanguagePreference` in `src/config.ts`), and a host build
+        // that learns a third language must not make an older panel guess at it.
+        if let Some(named) = crate::app::language::Language::known(
+            window.get("language").and_then(serde_json::Value::as_str),
+        ) {
+            self.language = named;
+        }
+        if let Some(always) = window.get("alwaysOnTop").and_then(serde_json::Value::as_bool) {
+            self.always_on_top = always;
+        }
+        if let Some(reduce) = window.get("reduceMotion").and_then(serde_json::Value::as_bool) {
+            self.reduce_motion = reduce;
+        }
+        self.anchor = window
+            .get("anchor")
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::app::geometry::Anchor::from_name)
+            .unwrap_or_default();
+    }
+
+    /// Put what the user chose in the panel's own settings on top of the configuration.
+    ///
+    /// The host's configuration is the baseline and a local choice is an override — never the
+    /// other way round, or the settings view would appear to do nothing. Only the fields the user
+    /// actually set are touched, so the host stays in charge of everything else (including the
+    /// theme, until someone picks one).
+    ///
+    /// **The two spellings meet here, once.** The design labels the switch by what it gives the
+    /// user — "失焦时保持展开" — while the configuration names the behaviour the process implements,
+    /// `hideOnBlur`. Converting between them in the settings view would spread the inversion across
+    /// every place that reads either; doing it at the boundary keeps one meaning per name.
+    ///
+    /// @param self - the settings to overlay onto.
+    /// @param preferences - what the user chose here, if anything.
+    /// @returns the effective settings.
+    #[must_use]
+    pub fn with_preferences(&self, preferences: &crate::app::preferences::Preferences) -> Self {
+        let mut effective = self.clone();
+        if let Some(theme) = preferences.theme {
+            effective.theme = theme;
+        }
+        if let Some(keep_open) = preferences.keep_open {
+            effective.hide_on_blur = !keep_open;
+        }
+        if let Some(language) = preferences.language {
+            effective.language = language;
+        }
+        if let Some(show) = preferences.floating_ball {
+            effective.floating_ball = show;
+        }
+        if let Some(logo) = &preferences.ball_logo {
+            effective.ball_logo = logo.clone();
+        }
+        if let Some(anchor) = preferences.anchor {
+            effective.anchor = anchor;
+        }
+        effective
+    }
+}
+
+/// Read a float-valued environment variable.
+fn float_env(key: &str, fallback: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(fallback)
+}
+
+/// Read an anchor-valued environment variable.
+///
+/// An unknown name keeps the default rather than moving the panel to a guess: the value crosses a
+/// language boundary (`WindowAnchor` in `src/config.ts`), and a build that predates a new spelling
+/// must not open the panel somewhere arbitrary.
+fn anchor_env(key: &str, fallback: crate::app::geometry::Anchor) -> crate::app::geometry::Anchor {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| crate::app::geometry::Anchor::from_name(&value))
+        .unwrap_or(fallback)
+}
+
+/// Read a boolean-valued environment variable, accepting the spellings the host
+/// and a human both produce.
+fn bool_env(key: &str, fallback: bool) -> bool {
+    match std::env::var(key) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => fallback,
+        },
+        Err(_) => fallback,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOGO: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+    #[test]
+    fn the_ball_is_hidden_with_the_official_logo_by_default() {
+        let settings = WindowSettings::default();
+        assert!(!settings.floating_ball);
+        assert_eq!(settings.ball_logo, "");
+    }
+
+    #[test]
+    fn host_and_local_preferences_share_one_effective_ball_configuration() {
+        let mut settings = WindowSettings::default();
+        settings.apply_host(Some(&serde_json::json!({
+            "floatingBall": true,
+            "ballLogo": LOGO,
+        })));
+        assert!(settings.floating_ball);
+        assert_eq!(settings.ball_logo, LOGO);
+
+        let preferences = crate::app::preferences::Preferences {
+            floating_ball: Some(false),
+            ball_logo: Some(String::new()),
+            ..crate::app::preferences::Preferences::default()
+        };
+        let effective = settings.with_preferences(&preferences);
+        assert!(!effective.floating_ball);
+        assert_eq!(effective.ball_logo, "");
+    }
+
+    #[test]
+    fn missing_and_invalid_host_anchors_fall_back_to_center() {
+        let mut settings = WindowSettings {
+            anchor: crate::app::geometry::Anchor::Center,
+            ..WindowSettings::default()
+        };
+        settings.apply_host(Some(&serde_json::json!({})));
+        assert_eq!(settings.anchor, crate::app::geometry::Anchor::Center);
+        settings.apply_host(Some(&serde_json::json!({"anchor": "top-left"})));
+        assert_eq!(settings.anchor, crate::app::geometry::Anchor::TopLeft);
+        settings.apply_host(Some(&serde_json::json!({"anchor": "elsewhere"})));
+        assert_eq!(settings.anchor, crate::app::geometry::Anchor::Center);
+    }
+
+    #[test]
+    fn an_explicit_anchor_preference_overrides_the_host_baseline() {
+        let settings = WindowSettings::default().with_preferences(&crate::app::preferences::Preferences {
+            anchor: Some(crate::app::geometry::Anchor::Center),
+            ..crate::app::preferences::Preferences::default()
+        });
+        assert_eq!(settings.anchor, crate::app::geometry::Anchor::Center);
+    }
+}

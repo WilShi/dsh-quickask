@@ -1,0 +1,206 @@
+// Category 1 (cross-process protocol): the method table every peer-visible method must agree with.
+// The protocol's method table, and the one failure it is prone to.
+//
+// A method is answered only if three things agree: the router's dispatch, the method list the
+// supervisor registers channel handlers from, and the peer's own idea of what it may ask. A list
+// of names that must agree with a switch will drift, and the symptom is the worst possible one —
+// `unsupported method: session/options` for a method that was implemented, in the panel's own
+// settings menu, with nothing in the log to say which side was wrong.
+//
+// So the list lives in one place (`METHODS`, in `src/bridge/router.ts`) and these tests walk it: every
+// entry must be answerable, and a method that is not in it must not be answerable either.
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+
+import { loadModule } from './helpers.mjs'
+
+const { HostRouter, METHODS } = await loadModule('bridge/router.js')
+
+/** A router host whose every method returns a recognisable value. */
+function stubHost() {
+  return {
+    config: () => ({}),
+    hostVersion: () => 'test',
+    channelSessionId: () => 'channel-1',
+    listWorkspaces: async () => [],
+    initializeDefaultWorkspace: async () => [],
+    listSessions: async () => ({ items: [] }),
+    createSession: async () => ({ sessionId: 'session-1' }),
+    attachSession: async () => ({ sessionId: 'session-1' }),
+    requestSnapshot: async sessionId => ({ sessionId, accepted: true }),
+    readHistory: async () => ({ records: [], hasMore: false, cursor: null }),
+    readImage: async () => ({ data: new Uint8Array([1]), mimeType: 'image/png' }),
+    readOptions: async () => ({ groups: [], permissions: [] }),
+    selectModel: async () => undefined,
+    setPermission: async () => undefined,
+    prompt: async () => ({ accepted: true }),
+    cancel: async () => ({ accepted: true }),
+    answerInteraction: async () => ({ accepted: true }),
+    reportPresence: async () => ({ accepted: true }),
+    panelLifecycle: async action => ({ action, accepted: true }),
+    diagnostics: () => ({}),
+  }
+}
+
+/** Parameters that get past each method's validation, so the dispatch itself is what is tested. */
+const PARAMS = {
+  // `quorfloatVersion` is an opaque mock value on purpose: this suite tests dispatch, not
+  // what the real binary reports, so the number here is never asserted against anything.
+  hello: { protocol: 'quorfloat/1', quorfloatVersion: '0.1.0', platform: 'darwin', arch: 'arm64' },
+  'window/visibility': { visible: true },
+  'session/create': { workspaceId: 'ws-1' },
+  'session/attach': { sessionId: 'session-1' },
+  'session/snapshot/request': { sessionId: 'session-1' },
+  'session/history': { sessionId: 'session-1' },
+  'session/image': { sessionId: 'session-1', path: 'image.png' },
+  'session/prompt': { sessionId: 'session-1', requestId: 'r-1', text: 'hi' },
+  'session/cancel': { sessionId: 'session-1' },
+  'session/options': {},
+  'session/select': { sessionId: 'session-1', provider: 'deepseek', model: 'v41' },
+  'session/permission': { sessionId: 'session-1', value: 'read-only' },
+  'interaction/answer': { interactionId: 'i-1', answer: {} },
+  'presence/report': { surface: 'panel', visible: true, focused: true, seq: 1 },
+  'panel/lifecycle': { action: 'restart' },
+}
+
+test('every method in the table is answered by the router', async () => {
+  // A method listed but not dispatched fails here, in the suite, rather than in the panel with an
+  // error nobody can place.
+  const router = new HostRouter(stubHost())
+  for (const method of METHODS) {
+    try {
+      await router.handle(method, PARAMS[method] ?? {})
+    } catch (error) {
+      assert.notEqual(
+        error?.message,
+        `unsupported method: ${method}`,
+        `${method} is in METHODS but the router does not answer it`,
+      )
+      // Any other failure is this test's parameters being incomplete, which is a test problem: the
+      // validation ran, so the method is dispatched.
+    }
+  }
+})
+
+test('a method that is not in the table is refused', async () => {
+  // The other direction: the table is the whole protocol, so a peer asking for something else is told
+  // so rather than reaching a handler.
+  const router = new HostRouter(stubHost())
+  await assert.rejects(
+    () => router.handle('session/invented', {}),
+    (error) => {
+      assert.equal(error.code, 'unavailable')
+      assert.match(error.message, /unsupported method/)
+      return true
+    },
+  )
+})
+
+test('the table names no method twice', () => {
+  assert.equal(new Set(METHODS).size, METHODS.length, 'a duplicate would register one handler twice')
+})
+
+test('the new session methods are in the table', () => {
+  // Named explicitly so a future edit that removes one is a deliberate act rather than an oversight:
+  // these three are what the panel's footer is built on.
+  for (const method of ['session/options', 'session/select', 'session/permission']) {
+    assert.ok(METHODS.includes(method), `${method} must be answerable`)
+  }
+})
+
+test('session/history asks below the peer cursor and answers with where paging continues', async () => {
+  // The one older-page request, in both directions. `beforeSeq` is the Harness's own exclusive
+  // backwards cursor (`SessionPageRequest.beforeSeq`), so its value is the oldest sequence the
+  // peer currently shows; the answer carries the page, whether older history remains, and the
+  // backwards cursor for the page below it. A router that renamed the field or dropped `cursor`
+  // would leave the sidecar guessing where to page next — and guessing is what duplicates turns.
+  const seen = []
+  const page = {
+    records: [{ type: 'event', event: { type: 'user/message', seq: 48, time: 1, data: {} } }],
+    hasMore: true,
+    cursor: 48,
+  }
+  const host = stubHost()
+  host.readHistory = async (sessionId, beforeSeq) => {
+    seen.push({ sessionId, beforeSeq })
+    return beforeSeq === undefined ? { records: [], hasMore: true, cursor: null } : page
+  }
+  const router = new HostRouter(host)
+
+  assert.deepEqual(await router.handle('session/history', { sessionId: 'session-1', beforeSeq: 50 }), page)
+  // The tail read: no cursor at all, which is how the peer asks for the newest page.
+  assert.deepEqual(await router.handle('session/history', { sessionId: 'session-1' }), {
+    records: [],
+    hasMore: true,
+    cursor: null,
+  })
+  assert.deepEqual(seen, [
+    { sessionId: 'session-1', beforeSeq: 50 },
+    { sessionId: 'session-1', beforeSeq: undefined },
+  ])
+
+  // A cursor that is present but not an integer is refused at the boundary: a fraction would
+  // reach the Harness as an invalid page bound, and the failure would surface as an empty page.
+  await assert.rejects(
+    () => router.handle('session/history', { sessionId: 'session-1', beforeSeq: 1.5 }),
+    error => {
+      assert.equal(error.code, 'unavailable')
+      assert.match(error.message, /session\/history: beforeSeq must be an integer/)
+      return true
+    },
+  )
+  await assert.rejects(
+    () => router.handle('session/history', {}),
+    error => {
+      assert.match(error.message, /session\/history: sessionId/)
+      return true
+    },
+  )
+  assert.ok(METHODS.includes('session/history'), 'and it is part of the table the supervisor registers')
+})
+
+test('workspace/default answers the same { items } shape as workspaces/list', async () => {
+  // The one method that *creates* rather than reads, and it deliberately looks like the read it
+  // sits beside: the peer parses both with one parser, and an empty list is the host saying it
+  // will not create one (never an error the peer has to catch). Asserted here, as the
+  // cross-process shape it is: the peer's parser is written against exactly this envelope.
+  const rows = [{ workspaceId: 'w1', path: '/tmp/ws', title: 'ws', sessionIds: [], createdAt: 1 }]
+  const host = stubHost()
+  host.initializeDefaultWorkspace = async () => rows
+  const router = new HostRouter(host)
+  assert.deepEqual(await router.handle('workspace/default', {}), { items: rows })
+  assert.ok(METHODS.includes('workspace/default'), 'and it is part of the table the supervisor registers')
+})
+
+test('panel/lifecycle forwards the requested action and reports it', async () => {
+  // The panel's tray menu is the caller, and the action reaches the supervisor as the action word the
+  // peer sent — not a pre-cooked decision. The reply names both the request and its acceptance, which
+  // is all a fire-and-forget caller could ever act on.
+  const seen = []
+  const host = stubHost()
+  host.panelLifecycle = async action => {
+    seen.push(action)
+    return { action, accepted: true }
+  }
+  const router = new HostRouter(host)
+  assert.deepEqual(await router.handle('panel/lifecycle', { action: 'restart' }), { action: 'restart', accepted: true })
+  assert.deepEqual(await router.handle('panel/lifecycle', { action: 'stop' }), { action: 'stop', accepted: true })
+  assert.deepEqual(seen, ['restart', 'stop'], 'both actions were passed through unchanged, in order')
+})
+
+test('panel/lifecycle refuses a missing or unknown action', async () => {
+  // A closed set, because the effect is a process-level one no caller can take back: anything that is
+  // not `restart` or `stop` must stop at validation rather than reach the supervisor.
+  const router = new HostRouter(stubHost())
+  for (const params of [{ action: 'reboot' }, { action: '' }, {}]) {
+    await assert.rejects(
+      () => router.handle('panel/lifecycle', params),
+      error => {
+        assert.equal(error.code, 'unavailable')
+        assert.match(error.message, /panel\/lifecycle: action/)
+        return true
+      },
+      `${JSON.stringify(params)} must be refused`,
+    )
+  }
+})

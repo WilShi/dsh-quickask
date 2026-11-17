@@ -1,0 +1,496 @@
+/**
+ * Method routing for the host side of the protocol.
+ *
+ * The router owns method names, parameter validation, and the handshake
+ * payloads. It delegates anything that touches Harness state to small injected
+ * interfaces, so this file can be exercised without a Harness runtime and the
+ * `src/index.ts` wiring stays the only place that knows about real services.
+ */
+
+import { ChannelError } from './errors.js'
+import { PROTOCOL_VERSION } from '../protocol.js'
+import type { QuorfloatConfig } from '../config.js'
+import { ImageChunks, type LocalImage } from './images.js'
+import { requestNavigation } from '../host/navigation.js'
+
+/** What the quorfloat process reports about itself in `hello`. */
+export interface HelloParams {
+  readonly protocol?: unknown
+  readonly quorfloatVersion?: unknown
+  readonly platform?: unknown
+  readonly arch?: unknown
+  readonly capabilities?: unknown
+  readonly hotkey?: unknown
+}
+
+/** Result of a successful handshake, kept for diagnostics. */
+export interface HandshakeFacts {
+  readonly protocol: string
+  readonly quorfloatVersion: string
+  readonly platform: string
+  readonly arch: string
+  readonly capabilities: readonly string[]
+  /** `null` when no hotkey was requested, otherwise what the peer reported. */
+  readonly hotkey: { readonly requested: string; readonly registered: boolean } | null
+  readonly at: number
+}
+
+/** Workspace listing entry, already projected away from Harness internals. */
+export interface WorkspaceView {
+  readonly workspaceId: string
+  readonly path: string
+  readonly title: string
+}
+
+/** Session listing entry, already projected away from Harness internals. */
+export interface SessionSummaryView {
+  readonly sessionId: string
+  readonly cwd?: string
+  readonly updatedAt: number
+  readonly running: boolean
+  readonly blank: boolean
+}
+
+/**
+ * The projection block the Harness attaches to each session-list row.
+ *
+ * The declared upstream shape is `SessionProjectionHints` — `kind`, `asOfSeq`, and the projection
+ * map in `values` — and the map's own `title` member is `string | null`. That is where a
+ * conversation's name lives: the Harness's `SessionSummary` declares **no top-level `title`**, so
+ * reading one there reads a field that never exists.
+ */
+export interface SessionProjectionsView {
+  readonly kind: 'cached' | 'sequenced'
+  readonly asOfSeq: number
+  readonly values: { readonly title?: string | null } & Record<string, unknown>
+}
+
+/**
+ * A page of durable history records, in the shape the wire can carry.
+ *
+ * `cursor` is the page's own backwards position — the value to send as the next
+ * `beforeSeq` — and `null` when the page carried no records to place it by. It is the
+ * Harness's own derivation from the page's oldest record, made explicit on the wire so the
+ * peer and the host cannot each arrive at a different answer about where paging continues.
+ */
+export interface HistoryPageView {
+  readonly records: readonly unknown[]
+  readonly hasMore: boolean
+  readonly cursor: number | null
+}
+
+/** Answer accepted for one pending approval or user question. */
+export type InteractionAnswer =
+  | { readonly kind: 'approval'; readonly outcome: 'allowed-once' | 'rejected' }
+  | { readonly kind: 'question'; readonly answers: readonly { readonly id: string; readonly selected: readonly string[]; readonly custom?: string }[] }
+
+/** What the panel can ask the host to do to the process that hosts it. */
+export type PanelLifecycleAction = 'restart' | 'stop'
+
+/** Everything the router needs from the rest of the host plugin. */
+export interface RouterHost {
+  /** Effective configuration currently in force. */
+  config(): QuorfloatConfig
+  /** The running Harness host version, reported to the peer for diagnostics. */
+  hostVersion(): string
+  /** Identity of this channel instance; changes on every restart. */
+  channelSessionId(): string
+  /** List Harness workspaces the user can choose from. */
+  listWorkspaces(): Promise<readonly WorkspaceView[]>
+  /**
+   * Initialize (or resolve) the Harness's first-use default workspace.
+   *
+   * A command rather than a read, and deliberately its own method: `workspaces/list` never
+   * creates anything, so a peer that wants the host to make a workspace has to say so. An
+   * empty list means the host declined — never an error, because the peer's next step is to
+   * prompt the user rather than to fail.
+   */
+  initializeDefaultWorkspace(): Promise<readonly WorkspaceView[]>
+  /** List sessions visible in the Harness session list. */
+  listSessions(cursor?: string): Promise<{ items: readonly SessionSummaryView[] }>
+  /** Create or idempotently adopt one session inside a workspace. */
+  createSession(workspaceId: string): Promise<{ sessionId: string }>
+  /** Start (or restart) the follow subscription for one session. */
+  attachSession(sessionId: string, fromSeq?: number): Promise<{ sessionId: string }>
+  /**
+   * Re-send one session's opening snapshot.
+   *
+   * The panel asks for this when a chunked snapshot did not complete: re-attaching is
+   * the recovery that exists, and the alternative is a panel that stays blank for the
+   * rest of the run. The panel bounds how often it asks, so this is not a retry loop.
+   */
+  requestSnapshot(sessionId: string): Promise<{ sessionId: string; accepted: boolean }>
+  /**
+   * Read one page of durable history.
+   *
+   * The peer's backwards paging request, in the Harness's own vocabulary: `beforeSeq` is the
+   * exclusive backwards cursor (`SessionPageRequest.beforeSeq` upstream, inside
+   * `packages/api/session-controller/src/types.ts`), and the answer carries the page's
+   * records, whether older history remains (`hasMore`), and the backwards cursor for the page
+   * below it (`cursor`). Without a `beforeSeq` the newest page is returned, which is the tail
+   * read.
+   */
+  readHistory(sessionId: string, beforeSeq?: number): Promise<HistoryPageView>
+  /** Read one bounded image through the Harness filesystem when available. */
+  readImage?(sessionId: string, path: string, signal: AbortSignal): Promise<LocalImage>
+  /** Read the model and permission choices for a session. */
+  readOptions(sessionId?: string): Promise<unknown>
+  /** Switch a session's model and reasoning effort together. */
+  selectModel(sessionId: string, selection: unknown): Promise<void>
+  /** Apply a permission preset to a session. */
+  setPermission(sessionId: string, value: string): Promise<void>
+  /** Admit one prompt; `requestId` is the caller's idempotency key. */
+  prompt(sessionId: string, requestId: string, text: string, content?: unknown): Promise<{ accepted: true }>
+  /** Request cancellation of the active turn. */
+  cancel(sessionId: string): Promise<{ accepted: true }>
+  /** Answer one pending interaction owned by this host. */
+  answerInteraction(interactionId: string, answer: unknown): Promise<{ accepted: boolean }>
+  /**
+   * Record one UI surface's presence report.
+   *
+   * Called from the browser half only; the panel's own visibility arrives over
+   * the stdio protocol instead.
+   */
+  reportPresence(
+    surface: string,
+    report: { visible: boolean; focused: boolean; seq: number; at?: number },
+  ): Promise<{ accepted: boolean; reason?: string }>
+  /**
+   * Replace or deliberately stop the process that hosts the panel.
+   *
+   * The panel's own tray menu is the only caller. `restart` goes through the
+   * supervisor's restart entry; `stop` must go through its stop entry, because
+   * only that marks the exit as deliberate — an exit the policy reads as a crash
+   * would be restarted, which is the opposite of a deliberate stop.
+   */
+  panelLifecycle(action: PanelLifecycleAction): Promise<{ action: PanelLifecycleAction; accepted: true }>
+  /** Free-form diagnostics for the settings/status surface. */
+  diagnostics(): Record<string, unknown>
+}
+
+/** Every method this host answers, in one place.
+ *
+ * **The single source of truth for the protocol.** A list of names that must agree with a `switch`
+ * is a list that will not; `conformance.test.mjs` walks this one and fails if any entry is not
+ * answerable.
+ */
+export const METHODS = [
+  'hello',
+  'window/visibility',
+  'workspaces/list',
+  'workspace/default',
+  'sessions/list',
+  'session/create',
+  'session/attach',
+  // The one method the *panel* asks of the host about the conversation stream itself:
+  // a chunked snapshot that lost a part is repaired by asking for the sequence again.
+  'session/snapshot/request',
+  // The panel's one older page. `beforeSeq` is the exclusive backwards cursor, the same
+  // field name the Harness uses on `SessionPageRequest`; the answer adds `cursor` (where
+  // paging continues) beside the page's `records` and `hasMore`.
+  'session/history',
+  'session/image',
+  'session/prompt',
+  'session/cancel',
+  'session/options',
+  'session/select',
+  'session/permission',
+  'interaction/answer',
+  'presence/report',
+  'panel/lifecycle',
+  'quorfloat/open-main',
+  'diag/snapshot',
+] as const
+
+/** Fields the router validates out of an inbound parameter object. */
+function requireString(params: unknown, field: string, context: string): string {
+  if (typeof params !== 'object' || params === null) {
+    throw new ChannelError('unavailable', `${context}: params must be an object`)
+  }
+  const value = (params as Record<string, unknown>)[field]
+  if (typeof value !== 'string' || value === '') {
+    throw new ChannelError('unavailable', `${context}: ${field} must be a non-empty string`)
+  }
+  return value
+}
+
+/** Read an optional integer field, rejecting a present-but-invalid value. */
+function optionalInt(params: unknown, field: string, context: string): number | undefined {
+  if (typeof params !== 'object' || params === null) return undefined
+  const value = (params as Record<string, unknown>)[field]
+  if (value === undefined || value === null) return undefined
+  if (!Number.isInteger(value)) {
+    throw new ChannelError('unavailable', `${context}: ${field} must be an integer when present`)
+  }
+  return value as number
+}
+
+/**
+ * Read and validate the panel's requested lifecycle action.
+ *
+ * A closed set is deliberate: an unknown action must be refused rather than
+ * forwarded, because the host's answer is a process-level effect that no caller
+ * can take back.
+ *
+ * @param params - `panel/lifecycle` parameters.
+ * @returns the validated action.
+ * @throws {ChannelError} when the action is missing, empty, or not one of the two.
+ */
+function readLifecycleAction(params: unknown): PanelLifecycleAction {
+  const action = requireString(params, 'action', 'panel/lifecycle')
+  if (action !== 'restart' && action !== 'stop') {
+    throw new ChannelError('unavailable', `panel/lifecycle: action must be restart or stop (got ${action})`)
+  }
+  return action
+}
+
+/**
+ * Host-side method router.
+ *
+ * `hello` is the only method with protocol-level meaning; every other method is
+ * forwarded to {@link RouterHost}. Methods are answered even while the
+ * handshake is still in progress, because refusing early frames would turn a
+ * slow start into a spurious failure.
+ */
+export class HostRouter {
+  readonly #host: RouterHost
+  readonly #images = new ImageChunks()
+  #handshake: HandshakeFacts | undefined
+
+  /**
+   * @param host - the host capabilities the router exposes to the peer.
+   */
+  constructor(host: RouterHost) {
+    this.#host = host
+  }
+
+  /** Handshake facts once `hello` succeeded; `undefined` before that. */
+  get handshake(): HandshakeFacts | undefined {
+    return this.#handshake
+  }
+
+  /** True once a compatible `hello` has been accepted. */
+  get handshaken(): boolean {
+    return this.#handshake !== undefined
+  }
+
+  /**
+   * Handle one inbound request.
+   *
+   * @param method - JSON-RPC method name.
+   * @param params - request parameters.
+   * @returns the method result.
+   * @throws {ChannelError} for unknown methods, bad parameters, or host failures.
+   */
+  async handle(method: string, params: unknown): Promise<unknown> {
+    switch (method) {
+      case 'hello':
+        return this.#hello(params)
+      case 'window/visibility':
+        return { visible: this.#readVisibility(params) }
+      case 'workspaces/list':
+        return { items: await this.#host.listWorkspaces() }
+      case 'workspace/default':
+        // No parameters, and no required ones: the peer is asking the host to make its
+        // first-use workspace, and the host decides the directory. The shape is the same
+        // `{ items }` as `workspaces/list`, so the peer reads both answers with one parser; an
+        // empty list is the host saying it will not (or cannot) create one.
+        return { items: await this.#host.initializeDefaultWorkspace() }
+      case 'sessions/list':
+        return await this.#host.listSessions(this.#optionalString(params, 'cursor'))
+      case 'session/create':
+        return await this.#host.createSession(requireString(params, 'workspaceId', 'session/create'))
+      case 'session/attach':
+        return await this.#host.attachSession(
+          requireString(params, 'sessionId', 'session/attach'),
+          optionalInt(params, 'fromSeq', 'session/attach'),
+        )
+      case 'session/snapshot/request':
+        // The peer's recovery for a chunked snapshot that could not be completed. Named
+        // as a request rather than inferred from an `attach` repeat, because the answer
+        // is what tells the peer its ask was heard.
+        return await this.#host.requestSnapshot(requireString(params, 'sessionId', 'session/snapshot/request'))
+      case 'session/history':
+        return await this.#host.readHistory(
+          requireString(params, 'sessionId', 'session/history'),
+          optionalInt(params, 'beforeSeq', 'session/history'),
+        )
+      case 'session/image':
+        return await this.#images.read(params, async (sessionId, path, signal) => {
+          if (!this.#host.readImage) throw new ChannelError('unavailable', 'image reader unavailable', { reason: 'unavailable' })
+          return await this.#host.readImage(sessionId, path, signal)
+        })
+      case 'session/prompt':
+        return await this.#host.prompt(
+          requireString(params, 'sessionId', 'session/prompt'),
+          requireString(params, 'requestId', 'session/prompt'),
+          requireString(params, 'text', 'session/prompt'),
+          (params as Record<string, unknown>)['content'],
+        )
+      case 'session/options':
+        // `sessionId` is **optional** here, unlike every other session method: the catalogs are
+        // process-wide, so a panel that has not attached yet can still be ready to show them.
+        return await this.#host.readOptions(this.#optionalString(params, 'sessionId'))
+      case 'session/select':
+        return await this.#host.selectModel(
+          requireString(params, 'sessionId', 'session/select'),
+          params,
+        )
+      case 'session/permission':
+        return await this.#host.setPermission(
+          requireString(params, 'sessionId', 'session/permission'),
+          requireString(params, 'value', 'session/permission'),
+        )
+      case 'session/cancel':
+        return await this.#host.cancel(requireString(params, 'sessionId', 'session/cancel'))
+      case 'presence/report':
+        // The stdio route exists for tests and for a peer that reports the panel's
+        // own presence. The browser half uses the gateway service instead, because
+        // window visibility only exists in the page.
+        return await this.#host.reportPresence(
+          requireString(params, 'surface', 'presence/report'),
+          readPresenceReport(params),
+        )
+      case 'interaction/answer':
+        return await this.#host.answerInteraction(
+          requireString(params, 'interactionId', 'interaction/answer'),
+          (params as Record<string, unknown>)['answer'],
+        )
+      case 'quorfloat/open-main':
+        return requestNavigation({
+          sessionId: this.#optionalString(params, 'sessionId') ?? null,
+          workspaceId: this.#optionalString(params, 'workspaceId') ?? null,
+        })
+      case 'panel/lifecycle':
+        // The one request whose answer is allowed to be undeliverable: by the
+        // time the action settles, the peer that asked is being replaced or
+        // killed, and the channel's safe write drops the reply. The handler
+        // therefore completes the action before reporting acceptance, and never
+        // throws for a peer that is already gone.
+        return await this.#host.panelLifecycle(readLifecycleAction(params))
+      case 'diag/snapshot':
+        return { config: this.#host.config(), handshake: this.#handshake ?? null, ...this.#host.diagnostics() }
+      default:
+        throw new ChannelError('unavailable', `unsupported method: ${method}`)
+    }
+  }
+
+  /**
+   * Validate the peer's `hello` and answer with this host's facts.
+   *
+   * @param params - `hello` parameters.
+   * @returns the handshake response sent back to the peer.
+   */
+  #hello(params: unknown): Record<string, unknown> {
+    const hello = (typeof params === 'object' && params !== null ? params : {}) as HelloParams
+    const protocol = typeof hello.protocol === 'string' ? hello.protocol : ''
+    if (protocol !== PROTOCOL_VERSION) {
+      throw new ChannelError('protocol-mismatch', `unsupported protocol version: ${protocol || '(missing)'}`, {
+        supported: [PROTOCOL_VERSION],
+        received: protocol,
+      })
+    }
+    const capabilities = Array.isArray(hello.capabilities)
+      ? hello.capabilities.filter((entry): entry is string => typeof entry === 'string')
+      : []
+    const hotkey = readHotkey(hello.hotkey)
+    this.#handshake = {
+      protocol,
+      quorfloatVersion: typeof hello.quorfloatVersion === 'string' ? hello.quorfloatVersion : 'unknown',
+      platform: typeof hello.platform === 'string' ? hello.platform : 'unknown',
+      arch: typeof hello.arch === 'string' ? hello.arch : 'unknown',
+      capabilities,
+      hotkey,
+      at: Date.now(),
+    }
+    const config = this.#host.config()
+    return {
+      protocol: PROTOCOL_VERSION,
+      hostVersion: this.#host.hostVersion(),
+      // The session identity of this channel instance. It is what makes an
+      // interaction answer verifiable: a stale channel id must not be able to
+      // settle a request owned by a newer channel.
+      sessionId: this.#host.channelSessionId(),
+      capabilities: ['workspace', 'session', 'history', 'prompt', 'cancel', 'interaction'],
+      window: config.window,
+      hotkey: config.hotkey,
+    }
+  }
+
+  /**
+   * Record the peer's visibility report.
+   *
+   * @param params - `window/visibility` parameters.
+   * @returns the acknowledged visibility flag.
+   */
+  #readVisibility(params: unknown): boolean {
+    if (typeof params !== 'object' || params === null) {
+      throw new ChannelError('unavailable', 'window/visibility: params must be an object')
+    }
+    const visible = (params as Record<string, unknown>)['visible']
+    if (typeof visible !== 'boolean') {
+      throw new ChannelError('unavailable', 'window/visibility: visible must be a boolean')
+    }
+    return visible
+  }
+
+  /**
+   * Read an optional string parameter.
+   *
+   * @param params - parameter object.
+   * @param field - field name.
+   * @returns the string, or `undefined` when absent.
+   */
+  #optionalString(params: unknown, field: string): string | undefined {
+    if (typeof params !== 'object' || params === null) return undefined
+    const value = (params as Record<string, unknown>)[field]
+    return typeof value === 'string' ? value : undefined
+  }
+}
+
+/**
+ * Read and validate one presence report from a browser surface.
+ *
+ * Both facts are required together: `visible` alone cannot distinguish "occluded
+ * on Windows" from "in front of the user", and `focused` alone is true for a
+ * window the user has on another display without looking at it.
+ *
+ * @param params - the raw request parameters.
+ * @returns the validated report.
+ * @throws {ChannelError} when a required field is missing or mistyped.
+ */
+function readPresenceReport(params: unknown): { visible: boolean; focused: boolean; seq: number; at?: number } {
+  if (typeof params !== 'object' || params === null) {
+    throw new ChannelError('unavailable', 'presence/report: params must be an object')
+  }
+  const record = params as Record<string, unknown>
+  if (typeof record['visible'] !== 'boolean') {
+    throw new ChannelError('unavailable', 'presence/report: visible must be a boolean')
+  }
+  if (typeof record['focused'] !== 'boolean') {
+    throw new ChannelError('unavailable', 'presence/report: focused must be a boolean')
+  }
+  if (!Number.isInteger(record['seq'])) {
+    throw new ChannelError('unavailable', 'presence/report: seq must be an integer')
+  }
+  const at = record['at']
+  if (at !== undefined && !Number.isFinite(at)) {
+    throw new ChannelError('unavailable', 'presence/report: at must be a finite number when present')
+  }
+  return at === undefined
+    ? { visible: record['visible'], focused: record['focused'], seq: record['seq'] as number }
+    : { visible: record['visible'], focused: record['focused'], seq: record['seq'] as number, at: at as number }
+}
+
+/**
+ * Normalize the peer's hotkey report.
+ *
+ * @param value - raw `hello.hotkey` value.
+ * @returns the normalized report, or `null` when the peer sent none.
+ */
+function readHotkey(value: unknown): { requested: string; registered: boolean } | null {
+  if (typeof value !== 'object' || value === null) return null
+  const record = value as Record<string, unknown>
+  if (typeof record['requested'] !== 'string') return null
+  return { requested: record['requested'], registered: record['registered'] === true }
+}

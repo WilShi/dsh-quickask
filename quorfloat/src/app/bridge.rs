@@ -1,0 +1,879 @@
+//! The bridge between the frontend and the session.
+//!
+//! One snapshot shape ([`snapshot`]), and the commands the page can issue. The
+//! snapshot is a projection — the frontend receives what it draws, never the
+//! session's own types — and it is rebuilt from the same state the session tests
+//! already guard, so the bridge adds no business rules of its own: every command
+//! here is a thin call into [`crate::app::session::Session`], and everything the
+//! snapshot carries was decided there.
+//!
+//! The one rule that lives here rather than in the session is the shell's own:
+//! which preferences the settings page may set, and which accelerators it may
+//! hold ([`apply_preferences`] / [`validate_hotkey`]).
+
+use serde_json::{json, Value};
+
+use crate::app::height::Height;
+use crate::app::workspace;
+use crate::app::preferences::Preferences;
+use crate::app::session::interaction::{
+    ApprovalVerdict, Interaction, InteractionState, Question, QuestionAnswer, SentAnswer,
+};
+use crate::app::session::transcript::{Block, Entry};
+use crate::app::session::{Delivery, FrameSink, Session, SessionOptions, Stats};
+use crate::app::window_settings::WindowSettings;
+
+/// The locale the panel asks the asker's own text for.
+///
+/// Every string this file writes is Chinese; the interaction detail is requested
+/// in Chinese too and falls back to `en` (see `Interaction::detail`).
+const DISPLAY_LOCALE: &str = "zh";
+
+/// The shell-level facts the snapshot carries beside the session.
+///
+/// Kept in one place so the snapshot is a pure function of two inputs: the
+/// session (owned by the reader) and this view (owned by the shell).
+#[derive(Debug, Clone)]
+pub struct ShellView {
+    /// The effective window configuration.
+    pub settings: WindowSettings,
+    /// The user's own choices, which sit on top of the host's configuration.
+    ///
+    /// Kept here rather than in a second place so the overlay is applied once,
+    /// in `with_preferences`, wherever the baseline changes.
+    pub preferences: Preferences,
+    /// The accelerator the user asked for, as the settings chip shows it.
+    pub hotkey_requested: Option<String>,
+    /// The accelerator actually held, which after a refusal is not the requested one.
+    pub hotkey_held: Option<String>,
+    /// Whether a grab is held right now.
+    pub hotkey_registered: bool,
+    /// Why the last attempt did not become the held one, when it did not.
+    pub hotkey_reason: Option<String>,
+    /// Whether the panel's native window is on screen right now.
+    ///
+    /// Owned by the dispatcher — it is the only thread that touches the window —
+    /// and carried here so the snapshot can tell the frontend which way the
+    /// transition should run.
+    pub visible: bool,
+    /// The height coordination state machine.
+    pub height: Height,
+    /// Which lifetime of this process the summon counter belongs to.
+    ///
+    /// A count alone cannot tell a summon from a reload: a webview reload or a sidecar restart
+    /// starts the count over, and the frontend would read the reset as a new visit and throw
+    /// away the workspace the user chose. The token is derived once, at startup, from facts
+    /// that change when the process does (see `main.rs`), so "same token, higher count" is the
+    /// only thing the frontend treats as a summon.
+    pub summon_token: String,
+    /// How many times the user has summoned the panel in this process's lifetime.
+    pub summon_count: u64,
+}
+
+/// The state the frontend renders, as JSON.
+///
+/// @param session - the session, which owns every business fact.
+/// @param shell - the shell's own facts (settings, hotkey, height).
+/// @returns the snapshot the frontend re-renders from.
+#[must_use]
+pub fn snapshot(session: &Session, shell: &ShellView) -> Value {
+    let follow = session.follow();
+    let transcript = session.transcript();
+    let settings = &shell.settings;
+    json!({
+        "settings": {
+            "width": settings.width,
+            "maxHeight": settings.max_height,
+            "alwaysOnTop": settings.always_on_top,
+            "reduceMotion": settings.reduce_motion,
+            "hideOnBlur": settings.hide_on_blur,
+            "anchor": settings.anchor.name(),
+            "floatingBall": settings.floating_ball,
+            "ballLogo": settings.ball_logo,
+            "theme": theme_name(settings.theme),
+            // The panel's language, in the Harness's own ids: the frontend picks its copy
+            // from it and the menu bar (a Rust-side surface) is labelled from the same
+            // value. Always present and always one of `zh` / `en` — the host resolves the
+            // setting and the first-launch seed before any frame reaches this process.
+            "language": settings.language.as_str(),
+        },
+        "hotkey": {
+            "requested": shell.hotkey_requested,
+            "held": shell.hotkey_held,
+            "registered": shell.hotkey_registered,
+            "reason": shell.hotkey_reason,
+        },
+        "height": {
+            "target": shell.height.target(),
+            "capped": shell.height.is_capped(),
+        },
+        "window": {
+            "visible": shell.visible,
+            // The summon counter and the lifetime it belongs to. Both are shell facts; the
+            // frontend clears the visit's workspace choice only when the count rises *within
+            // one token* (see `logic/summon.ts`).
+            "summon": {
+                "token": shell.summon_token,
+                "count": shell.summon_count,
+            },
+        },
+        "session": {
+            "ready": session.is_ready(),
+            "following": follow.session_id().map(|session_id| json!({
+                "sessionId": session_id,
+                "label": follow.label(),
+                "generation": follow.generation(),
+                "events": follow.events(),
+                "streams": follow.streams(),
+                "resyncs": follow.resyncs(),
+                "stale": follow.stale(),
+            })),
+            "pinned": session.pinned_conversation(),
+            // The workspace half of the pin, which is *independent* of the conversation half:
+            // it is where a new conversation starts, never a projection of the pinned one.
+            "pinnedWorkspace": session.pinned_workspace(),
+            // Why a half of the pin was forgotten, as a reason the frontend turns into copy.
+            // Never a sentence: the panel's text lives in its own dictionaries.
+            "pinNotice": session.pin_notice().map(|notice| json!({ "kind": notice.wire() })),
+            // Where a conversation submitted right now would be created. The panel shows it in
+            // its workspace field, so that state and the ladder cannot disagree: without it the
+            // field says "选择工作区" while the create is already resolved to a real one. It is
+            // the same resolution `submit` uses, with no panel choice to prefer — the panel's own
+            // pick is not the shell's to know.
+            "createWorkspace": create_workspace(session, None),
+            "chosen": session.target_conversation(),
+            "createFailure": follow.create_failure(),
+            "conversations": session
+                .conversations()
+                .map(|summary| json!({
+                    "sessionId": summary.session_id,
+                    "updatedAt": summary.updated_at,
+                    "title": summary.title,
+                    "label": summary.label,
+                    "cwd": summary.cwd,
+                    "running": summary.running,
+                    "blank": summary.blank,
+                }))
+                .collect::<Vec<_>>(),
+            "workspaces": session
+                .workspaces()
+                .iter()
+                .map(|workspace| json!({
+                    "workspaceId": workspace.workspace_id,
+                    "title": workspace.title,
+                    "path": workspace.path,
+                    // The registry's own membership account. A consumer intersects it with the
+                    // conversations it can see: it can name a conversation the session list no
+                    // longer shows (or a subagent, which the session list never shows).
+                    "sessionIds": workspace.session_ids,
+                    // Epoch milliseconds, and one unit end to end: the host converts the
+                    // registry's ISO timestamp once, here it is a number, and the frontend
+                    // guards it again on the way in.
+                    "createdAt": workspace.created_at,
+                }))
+                .collect::<Vec<_>>(),
+            "workspacesAsked": session.workspaces_asked(),
+            // Whether that ask has been *answered*: "not arrived yet" and "there are none" are
+            // different facts, and the picker says different things about them.
+            "workspacesLoaded": session.workspaces_loaded(),
+            // What came of asking the host for its first-use default workspace. The
+            // `workspace.needHost` prompt belongs to `failed` and to nothing else.
+            "defaultWorkspace": { "state": session.default_workspace().wire() },
+            "options": session.options().map(options_view),
+            "stats": session.stats().map(|stats| stats_view(&stats)),
+            "settingFailure": session.setting_failure(),
+        },
+        "transcript": {
+            "sessionId": transcript.session_id(),
+            "cursor": transcript.cursor(),
+            "title": transcript.title(),
+            "streaming": transcript.is_streaming(),
+            "turnActive": transcript.is_turn_active(),
+            // Whether the host says history precedes the oldest line on screen. The panel
+            // draws the "load earlier" control on this and on nothing else: a control that
+            // is offered when there is nothing behind it is a control that lies.
+            "hasMore": transcript.has_more(),
+            // Whether a page is in flight, which is the control's busy state.
+            "loadingEarlier": session.loading_history(),
+            "entries": transcript.entries().iter().map(entry_view).collect::<Vec<_>>(),
+            "live": transcript.live_entry().as_ref().map(entry_view),
+        },
+        "interactions": session.interactions().iter().map(interaction_view).collect::<Vec<_>>(),
+        "handoff": session.handoff().map(|handoff| json!({
+            "kind": handoff.kind().as_str(),
+            "reason": handoff.reason(),
+            "surfaces": handoff.surfaces(),
+        })),
+        "delivery": {
+            "prompt": delivery_view(session.prompt_delivery()),
+            "cancel": delivery_view(session.cancel_delivery()),
+        },
+    })
+}
+
+/// One transcript line, in the frontend's vocabulary.
+fn entry_view(entry: &Entry) -> Value {
+    match entry {
+        Entry::User { text } => json!({ "kind": "user", "text": text }),
+        Entry::Assistant { blocks, streaming } => json!({
+            "kind": "assistant",
+            "streaming": streaming,
+            "blocks": blocks.iter().map(block_view).collect::<Vec<_>>(),
+        }),
+        Entry::Tool { name, text, is_error } => {
+            json!({ "kind": "tool", "name": name, "text": text, "isError": is_error })
+        }
+        Entry::System { text } => json!({ "kind": "system", "text": text }),
+    }
+}
+
+/// One content block, in the frontend's vocabulary.
+fn block_view(block: &Block) -> Value {
+    match block {
+        Block::Text(text) => json!({ "kind": "text", "text": text }),
+        Block::Reasoning(text) => json!({ "kind": "reasoning", "text": text }),
+        Block::Call { name, arguments } => json!({ "kind": "call", "name": name, "arguments": arguments }),
+    }
+}
+
+/// One card, in the frontend's vocabulary.
+///
+/// `answers` is what *this panel* sent for a question card, not the host's copy: it is
+/// empty while the card is pending, and it is carried for `submitting` and `applied` so
+/// the card can still show the user what they chose after the widgets are gone. The
+/// verdict fields stay approval-only, exactly as they were.
+fn interaction_view(interaction: &Interaction) -> Value {
+    let (state, verdict, refusal, answers) = match interaction.state() {
+        InteractionState::Pending => ("pending", None, None, &[][..]),
+        InteractionState::Submitting { answer } => {
+            let (verdict, answers) = sent_view(answer);
+            ("submitting", verdict, None, answers)
+        }
+        InteractionState::Applied { answer } => {
+            let (verdict, answers) = sent_view(answer);
+            ("applied", verdict, None, answers)
+        }
+        InteractionState::Refused { reason } => ("refused", None, Some(reason.as_str()), &[][..]),
+    };
+    json!({
+        "id": interaction.id(),
+        "sessionId": interaction.session_id(),
+        "kind": interaction.kind().as_str(),
+        "state": state,
+        "verdict": verdict,
+        "refusalReason": refusal,
+        "actionable": interaction.is_actionable(),
+        "toolName": interaction.tool_name(),
+        "detail": interaction.detail(DISPLAY_LOCALE),
+        "questions": interaction.questions().iter().map(question_view).collect::<Vec<_>>(),
+        "answers": answers.iter().map(answer_view).collect::<Vec<_>>(),
+        "questionCount": interaction.question_count(),
+    })
+}
+
+/// What a settled answer consisted of, split into the two fields the frontend reads.
+///
+/// An approval carries a verdict and no answers; a question carries answers and no
+/// verdict. Both live in one match so a new kind of answer cannot be half-projected.
+///
+/// @param answer - what was sent.
+/// @returns the `verdict` field and the answers to show, in that order.
+fn sent_view(answer: &SentAnswer) -> (Option<&'static str>, &[QuestionAnswer]) {
+    match answer {
+        SentAnswer::Approval(verdict) => (Some(verdict.wire()), &[]),
+        SentAnswer::Question(answers) => (None, answers.as_slice()),
+    }
+}
+
+/// One question, in the frontend's vocabulary.
+///
+/// Every optional field is written as an explicit `null` rather than omitted, because
+/// the frontend's type says `string | null` and a missing key would be a different type
+/// to it than an absent heading.
+fn question_view(question: &Question) -> Value {
+    json!({
+        "id": question.id,
+        "header": question.header,
+        "question": question.question,
+        "detail": question.detail,
+        "options": question
+            .options
+            .iter()
+            .map(|option| json!({ "label": option.label, "description": option.description }))
+            .collect::<Vec<_>>(),
+        "multiSelect": question.multi_select,
+    })
+}
+
+/// One answer this panel sent, in the frontend's vocabulary.
+///
+/// `custom` is `null` rather than a missing key, matching the `custom?: string` the
+/// frontend sends and the nullability it reads back.
+fn answer_view(answer: &QuestionAnswer) -> Value {
+    json!({ "id": answer.id, "selected": answer.selected, "custom": answer.custom })
+}
+
+/// What became of an outbound request, in the frontend's vocabulary.
+fn delivery_view(delivery: &Delivery) -> Value {
+    match delivery {
+        Delivery::Idle => json!({ "state": "idle", "status": null }),
+        Delivery::Sending => json!({ "state": "sending", "status": "已提交，等待 Harness 确认…" }),
+        Delivery::Accepted => json!({ "state": "accepted", "status": null }),
+        Delivery::Failed { reason } => {
+            json!({ "state": "failed", "status": format!("未发送：{reason}") })
+        }
+    }
+}
+
+/// The model and permission catalogs, in the frontend's vocabulary.
+fn options_view(options: &SessionOptions) -> Value {
+    json!({
+        "models": options
+            .models
+            .iter()
+            .map(|model| json!({
+                "provider": model.provider,
+                "providerName": model.provider_name,
+                "id": model.id,
+                "name": model.name,
+                "description": model.description,
+                "efforts": model
+                    .efforts
+                    .iter()
+                    .map(|effort| json!({
+                        "id": effort.id,
+                        "name": effort.name,
+                        "description": effort.description,
+                    }))
+                    .collect::<Vec<_>>(),
+                "defaultEffort": model.default_effort,
+            }))
+            .collect::<Vec<_>>(),
+        "current": options.current_model.as_ref().map(|(provider, model)| json!({
+            "provider": provider,
+            "model": model,
+            "reasoningEffort": options.current_effort,
+        })),
+        "permissions": options
+            .permissions
+            .iter()
+            .map(|permission| json!({
+                "value": permission.value,
+                "name": permission.name,
+                "description": permission.description,
+            }))
+            .collect::<Vec<_>>(),
+        "permission": options.current_permission,
+    })
+}
+
+/// The conversation statistics, in the frontend's vocabulary.
+fn stats_view(stats: &Stats) -> Value {
+    json!({
+        "turns": stats.turns,
+        "steps": stats.steps,
+        "tokensPerSecond": stats.tokens_per_second,
+        "totalTokens": stats.total_tokens,
+        "cacheHitPercent": stats.cache_hit_percent,
+        "contextTokens": stats.context_tokens,
+        "contextLimit": stats.context_limit,
+    })
+}
+
+/// The wire name for one theme preference.
+fn theme_name(theme: crate::app::theme::Preference) -> &'static str {
+    match theme {
+        crate::app::theme::Preference::System => "system",
+        crate::app::theme::Preference::Light => "light",
+        crate::app::theme::Preference::Dark => "dark",
+    }
+}
+
+// ── commands ─────────────────────────────────────────────────────────────────
+
+/// `submit` — send the user's text to the conversation this panel follows.
+///
+/// @param session - the session.
+/// @param sink - where the request goes.
+/// @param text - the user's text; blank input is refused by the session.
+/// @param workspace_id - the workspace the panel chose for a new conversation, if any.
+/// @returns the delivery, in the frontend's vocabulary.
+#[must_use]
+pub fn submit(
+    session: &mut Session,
+    sink: &mut dyn FrameSink,
+    text: &str,
+    workspace_id: Option<&str>,
+    image: Option<crate::app::session::ImageAttachment>,
+) -> Value {
+    let workspace_id = create_workspace(session, workspace_id);
+    let delivery = session.send_prompt(text, workspace_id.as_deref(), image, sink);
+    json!({ "delivery": delivery_view(&delivery) })
+}
+
+/// Which workspace a new conversation is created in.
+///
+/// The panel's own choice wins while it still names one of the host's workspaces — the
+/// picker only offers those, so a value the list no longer has is a stale snapshot rather
+/// than an instruction. Everything else falls to the ladder in [`crate::app::workspace`],
+/// which validates its own rungs: P0 is this window's own pin, P3 is the most recently
+/// active workspace, and `None` is P4 — nothing to go on, so the panel has to ask the user.
+///
+/// The panel sends its choice when it has one and usually has none in the new-conversation
+/// state, so without this the ladder is never consulted and a submit fails with "choose a
+/// workspace" while the host is listing several.
+///
+/// @param session - the session, which holds the host's lists and the workspace pin.
+/// @param chosen - what the panel sent, if anything.
+/// @returns the workspace to ask for, or `None` when only the user can decide.
+fn create_workspace(session: &Session, chosen: Option<&str>) -> Option<String> {
+    let follow = session.follow();
+    let workspaces = follow.workspaces();
+    chosen
+        .filter(|id| !id.trim().is_empty())
+        .filter(|id| workspaces.iter().any(|workspace| workspace.workspace_id == *id))
+        .map(str::to_owned)
+        // Nothing is on screen in the new-conversation state, so the ladder's P1 (the running
+        // conversation's directory) cannot apply: this is P0, then P3, then the user.
+        .or_else(|| workspace::to_create_in(session.pinned_workspace(), None, false, workspaces, follow.sessions()))
+}
+
+/// `cancel` — stop the turn being generated.
+///
+/// @returns whether a cancel was sent, and its delivery state.
+#[must_use]
+pub fn cancel(session: &mut Session, sink: &mut dyn FrameSink) -> Value {
+    let accepted = session.cancel_turn(sink);
+    json!({ "accepted": accepted, "delivery": delivery_view(session.cancel_delivery()) })
+}
+
+/// `answer_approval` — settle one approval card.
+///
+/// @param interaction_id - which card.
+/// @param allow - grant this one call, or refuse it.
+/// @returns whether an answer was sent (the session refuses stale, resolved, or
+///   question cards).
+#[must_use]
+pub fn answer_approval(
+    session: &mut Session,
+    sink: &mut dyn FrameSink,
+    interaction_id: &str,
+    allow: bool,
+) -> Value {
+    let verdict = if allow { ApprovalVerdict::AllowOnce } else { ApprovalVerdict::Reject };
+    json!({ "sent": session.answer_interaction(interaction_id, verdict, sink) })
+}
+
+/// `answer_question` — settle one question card with what the user chose.
+///
+/// A thin call, like [`answer_approval`]: the caps, the validation and the frame all
+/// belong to the session, so the bridge cannot grow a second opinion about what a
+/// complete answer is.
+///
+/// @param interaction_id - which card.
+/// @param answers - one answer per question, `selected` holding option **labels**.
+/// @returns whether an answer was sent (the session refuses stale, resolved,
+///   over-large, and incomplete answers, logging why).
+#[must_use]
+pub fn answer_question(
+    session: &mut Session,
+    sink: &mut dyn FrameSink,
+    interaction_id: &str,
+    answers: Vec<QuestionAnswer>,
+) -> Value {
+    json!({ "sent": session.answer_question(interaction_id, answers, sink) })
+}
+
+/// `select_session` — follow a different conversation.
+///
+/// @returns whether the attach request was written.
+#[must_use]
+pub fn select_session(session: &mut Session, sink: &mut dyn FrameSink, session_id: &str) -> Value {
+    json!({ "accepted": session.choose_conversation(session_id, sink) })
+}
+
+/// `load_earlier` — ask for one older page of the conversation on screen.
+///
+/// A thin call, like the other commands: whether there *is* anything older, where the
+/// backwards cursor points, and how many entries the page may hold all belong to the session
+/// and the host. The answer is whether a request went out; the page itself arrives as the
+/// next snapshot, so the panel never has to merge anything.
+///
+/// @param session - the session.
+/// @param sink - where the request goes.
+/// @returns whether a page request was written.
+#[must_use]
+pub fn load_earlier(session: &mut Session, sink: &mut dyn FrameSink) -> Value {
+    json!({ "accepted": session.request_history(sink) })
+}
+
+/// `start_new` — go back to "new conversation" mode, dropping the followed one.
+///
+/// The panel's own "new conversation" action also lets go of the pin (that is what the gesture
+/// means here), so the file is brought up to date: a pin the user dropped must not come back on
+/// the next run. The workspace half is not touched.
+///
+/// @param pinned_path - where the pin is remembered; `None` is "nowhere to write".
+#[must_use]
+pub fn start_new(session: &mut Session, sink: &mut dyn FrameSink, pinned_path: Option<&std::path::Path>) -> Value {
+    session.start_new_conversation(sink);
+    save_pins(session, pinned_path, sink);
+    json!({})
+}
+
+/// `pin` — pin one conversation (or stop pinning), and remember it across runs.
+///
+/// **The session half only.** The workspace half of the file is left exactly as it was: the two
+/// pins are independent facts, and "always open this conversation" says nothing about where a
+/// *new* one starts. A file written by an older build is read leniently, and nothing here ever
+/// derives one half from the other.
+///
+/// @param session_id - which one, or `None`.
+/// @param pinned_path - where the pin is remembered; `None` is "nowhere to write".
+/// @returns whether a request was written, and the two halves as they now stand.
+#[must_use]
+pub fn pin(
+    session: &mut Session,
+    sink: &mut dyn FrameSink,
+    session_id: Option<&str>,
+    pinned_path: Option<&std::path::Path>,
+) -> Value {
+    let accepted = session.pin_conversation(session_id.map(str::to_owned), sink);
+    save_pins(session, pinned_path, sink);
+    json!({
+        "accepted": accepted,
+        "pinned": session.pinned_conversation(),
+        "pinnedWorkspace": session.pinned_workspace(),
+    })
+}
+
+/// `pin_workspace` — pin the default directory for a new conversation.
+///
+/// **The workspace half only**, and it does not touch the conversation on screen: the session
+/// pin decides which conversation opens, this decides where a new one is created, and a gesture
+/// on one is not a statement about the other. (Choosing a directory in the picker *is* a
+/// new-conversation action; pinning one is not.)
+///
+/// @param workspace_id - which workspace, or `None` to stop pinning one.
+/// @param pinned_path - where the pin is remembered; `None` is "nowhere to write".
+/// @returns the two halves of the pin as they now stand.
+#[must_use]
+pub fn pin_workspace(
+    session: &mut Session,
+    sink: &mut dyn FrameSink,
+    workspace_id: Option<&str>,
+    pinned_path: Option<&std::path::Path>,
+) -> Value {
+    session.pin_workspace(workspace_id.map(str::to_owned));
+    save_pins(session, pinned_path, sink);
+    json!({
+        "pinned": session.pinned_conversation(),
+        "pinnedWorkspace": session.pinned_workspace(),
+    })
+}
+
+/// Write the pin file from the session's own two halves.
+///
+/// The file is one small JSON object and is written whole, but only the half the caller touched
+/// has changed: the other is whatever the session adopted from that same file at startup (see
+/// [`crate::app::pinned`]), or what an earlier gesture wrote. The write consumes the
+/// "something changed" flag so the clock thread does not write the same bytes again.
+///
+/// @param session - the session that owns the pins.
+/// @param path - where the pin is remembered; `None` is "nowhere to write".
+/// @param sink - where a failed save is recorded.
+fn save_pins(session: &mut Session, path: Option<&std::path::Path>, sink: &mut dyn FrameSink) {
+    session.take_pins_changed();
+    if let Err(error) = write_pins(session, path) {
+        sink.mark(&format!("pins save failed: {error}"));
+    }
+}
+
+/// Write the pin file, without touching the changed flag.
+fn write_pins(session: &Session, path: Option<&std::path::Path>) -> std::io::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    let pins = crate::app::pinned::Pinned {
+        session: session.pinned_conversation().map(str::to_owned),
+        workspace: session.pinned_workspace().map(str::to_owned),
+    };
+    pins.save(path)
+}
+
+/// Write the pin file when the reconciliation layer forgot a half of it.
+///
+/// The session layer decides *that* a half is invalid (it is the side that reads the host's
+/// lists); this is where the decision becomes durable, because only the shell knows where the
+/// file is. Called from the clock thread, right after the follow layer has been pumped.
+///
+/// @param session - the session that owns the pins.
+/// @param path - where the pin is remembered; `None` is "nowhere to write".
+/// @param sink - where a failed save is recorded.
+/// @returns whether a write happened, so the caller can tell the frontend to re-render.
+pub fn persist_pins(
+    session: &mut Session,
+    path: Option<&std::path::Path>,
+    sink: &mut dyn FrameSink,
+) -> bool {
+    if !session.take_pins_changed() {
+        return false;
+    }
+    if let Err(error) = write_pins(session, path) {
+        sink.mark(&format!("pins save failed: {error}"));
+    }
+    true
+}
+
+/// `on_show` — what a summon means for the conversation: **every summon lands on a
+/// fresh new-conversation state; the pin is the user's way of continuing a specific
+/// conversation instead.**
+///
+/// - a pinned conversation that the panel is not currently following is
+///   re-attached (the pin is the continuation escape hatch);
+/// - no pin: `start_new_conversation` — the detach leaves the previous
+///   conversation honestly, nothing is created until the user submits.
+///
+/// The dispatcher calls this on the *hotkey* show path only: a show the host
+/// asks for (an approval, say) is the host's intent, not the user's summon.
+///
+/// A summon is also the boundary of a **visit**: the last visit's explanation of a lost pin is
+/// over, one definitive refusal may cost a pin again, and the workspace list the
+/// new-conversation ladder needs is marked as wanted — the follow layer sends it on the next
+/// free poll slot, because this path may already be writing the attach that returns to the
+/// pinned conversation and this layer runs one request at a time. The counter the frontend
+/// watches rises here, and it only means something beside the token: see
+/// [`ShellView::summon_token`].
+///
+/// @param shell - the shell's own facts, whose summon counter rises.
+/// @returns an empty result — the frame the session may have written is the
+///   outcome, not this value.
+#[must_use]
+pub fn on_show(session: &mut Session, shell: &mut ShellView, sink: &mut dyn FrameSink) -> Value {
+    session.begin_visit();
+    shell.summon_count = shell.summon_count.saturating_add(1);
+    match session.pinned_conversation().map(str::to_owned) {
+        Some(pinned) if session.follow().session_id() == Some(pinned.as_str()) => {}
+        Some(pinned) => {
+            session.pin_conversation(Some(pinned), sink);
+        }
+        None => {
+            session.start_new_conversation(sink);
+        }
+    }
+    json!({})
+}
+
+/// `request_workspaces` — ask the host for the workspace list the picker draws.
+#[must_use]
+pub fn request_workspaces(session: &mut Session, sink: &mut dyn FrameSink) -> Value {
+    json!({ "accepted": session.request_workspaces(sink) })
+}
+
+/// `select_model` — apply one model (and reasoning effort) to the followed session.
+#[must_use]
+pub fn select_model(
+    session: &mut Session,
+    sink: &mut dyn FrameSink,
+    provider: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> Value {
+    session.select_model(provider, model, effort, sink);
+    json!({})
+}
+
+/// `set_permission` — apply one permission preset to the followed session.
+#[must_use]
+pub fn set_permission(session: &mut Session, sink: &mut dyn FrameSink, value: &str) -> Value {
+    session.set_permission(value, sink);
+    json!({})
+}
+
+/// `dismiss_interaction` — drop one card locally, without answering it.
+///
+/// @returns whether a card was dropped.
+#[must_use]
+pub fn dismiss_interaction(session: &mut Session, interaction_id: &str) -> Value {
+    json!({ "dropped": session.dismiss_interaction(interaction_id) })
+}
+
+/// `dismiss_handoff` — clear the "go to the Harness window" notice.
+#[must_use]
+pub fn dismiss_handoff(session: &mut Session) -> Value {
+    session.dismiss_handoff();
+    json!({})
+}
+
+/// `log` — put one frontend breadcrumb on the record.
+///
+/// Written to the **marker**, not stderr: the host swallows the sidecar's
+/// stderr, so a line there would be exactly as invisible as the problem the
+/// frontend is trying to report. The marker is the one surface a developer
+/// (or a test) reads afterwards.
+#[must_use]
+pub fn log(sink: &mut dyn FrameSink, line: &str) -> Value {
+    sink.mark(line);
+    json!({})
+}
+
+/// `set_preferences` — apply what the settings page changed.
+///
+/// The validation rules are the shell's own, and they are strict on purpose: a
+/// preference is remembered across runs, so a value this build cannot honour must
+/// be refused here rather than quietly becoming something else on the next start.
+///
+/// @param preferences - what is already set; the incoming values sit on top.
+/// @param incoming - `{theme?, keepOpen?, hotkey?, language?}`.
+/// @returns the updated preferences, or an error naming the refused value.
+pub fn apply_preferences(mut preferences: Preferences, incoming: &Value) -> Result<Preferences, String> {
+    if let Some(theme) = incoming.get("theme").and_then(Value::as_str) {
+        let theme = theme.trim();
+        if ["system", "light", "dark"].iter().any(|known| known.eq_ignore_ascii_case(theme)) {
+            preferences.theme = Some(crate::app::theme::Preference::from_name(Some(theme)));
+        } else {
+            return Err(format!("读不懂这个主题：{theme}"));
+        }
+    }
+    if let Some(keep_open) = incoming.get("keepOpen").and_then(Value::as_bool) {
+        preferences.keep_open = Some(keep_open);
+    }
+    if let Some(hotkey) = incoming.get("hotkey").and_then(Value::as_str) {
+        let hotkey = hotkey.trim();
+        validate_hotkey(hotkey)?;
+        preferences.hotkey = Some(hotkey.to_owned());
+    }
+    if let Some(show) = incoming.get("floatingBall").and_then(Value::as_bool) {
+        preferences.floating_ball = Some(show);
+    }
+    if let Some(logo) = incoming.get("ballLogo").and_then(Value::as_str) {
+        if !crate::app::preferences::valid_ball_logo(logo) {
+            return Err("ballLogo must be an image data URL of at most 512 KiB".to_owned());
+        }
+        preferences.ball_logo = Some(logo.to_owned());
+    }
+    if let Some(anchor) = incoming.get("anchor").and_then(Value::as_str) {
+        preferences.anchor = Some(crate::app::geometry::Anchor::from_name(anchor).unwrap_or_default());
+    }
+    if let Some(language) = incoming.get("language").and_then(Value::as_str) {
+        // Refused rather than remapped, for the same reason an unknown theme is: a
+        // language this build does not ship cannot be honoured, and quietly becoming
+        // `zh` would make the settings page look like it worked.
+        match crate::app::language::Language::known(Some(language)) {
+            Some(language) => preferences.language = Some(language),
+            None => return Err(format!("读不懂这个语言：{language}")),
+        }
+    }
+    Ok(preferences)
+}
+
+/// Whether an accelerator the settings page recorded is one this process may hold.
+///
+/// Two rules, both load-bearing:
+///
+/// - the accelerator must be one this build can read back
+///   ([`crate::runtime::hotkey::parse_accelerator`]);
+/// - a **bare** letter, digit, or punctuation key is refused: a global hotkey is
+///   grabbed from the whole desktop, so binding `M` would take the letter M away
+///   from every application. Function keys are exempt — nobody "types" an F13 by
+///   accident.
+///
+/// @param spec - the accelerator text, in the host's spelling.
+/// @returns `Ok(())`, or a message the settings page can show.
+pub fn validate_hotkey(spec: &str) -> Result<(), String> {
+    let Some(parsed) = crate::runtime::hotkey::parse_accelerator(spec) else {
+        return Err(format!("读不懂这个快捷键：{spec}"));
+    };
+    if parsed.mods.is_empty() && is_bare_typing_key(parsed.key) {
+        return Err("裸按键会被整个桌面占用，请加上修饰键（Ctrl / Alt / Cmd / Shift）".to_owned());
+    }
+    Ok(())
+}
+
+/// The keys that would steal typing from every application if grabbed bare.
+fn is_bare_typing_key(key: global_hotkey::hotkey::Code) -> bool {
+    use global_hotkey::hotkey::Code as K;
+    matches!(
+        key,
+        K::KeyA | K::KeyB | K::KeyC | K::KeyD | K::KeyE | K::KeyF | K::KeyG | K::KeyH | K::KeyI
+            | K::KeyJ | K::KeyK | K::KeyL | K::KeyM | K::KeyN | K::KeyO | K::KeyP | K::KeyQ
+            | K::KeyR | K::KeyS | K::KeyT | K::KeyU | K::KeyV | K::KeyW | K::KeyX | K::KeyY
+            | K::KeyZ
+            | K::Digit0 | K::Digit1 | K::Digit2 | K::Digit3 | K::Digit4 | K::Digit5 | K::Digit6
+            | K::Digit7 | K::Digit8 | K::Digit9
+            | K::Backquote | K::Minus | K::Equal | K::BracketLeft | K::BracketRight
+            | K::Backslash | K::Semicolon | K::Quote | K::Comma | K::Period | K::Slash
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::height::Height;
+    use crate::app::session::{HotkeyReport, Identity};
+
+    const LOGO: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+    #[test]
+    fn ball_preferences_are_applied_and_the_empty_logo_restores_the_official_mark() {
+        let preferences = apply_preferences(Preferences::default(), &json!({
+            "floatingBall": true,
+            "ballLogo": LOGO,
+        })).unwrap();
+        assert_eq!(preferences.floating_ball, Some(true));
+        assert_eq!(preferences.ball_logo.as_deref(), Some(LOGO));
+
+        let restored = apply_preferences(preferences, &json!({
+            "floatingBall": false,
+            "ballLogo": "",
+        })).unwrap();
+        assert_eq!(restored.floating_ball, Some(false));
+        assert_eq!(restored.ball_logo.as_deref(), Some(""));
+        assert!(apply_preferences(Preferences::default(), &json!({
+            "ballLogo": "https://example.com/logo.png",
+        })).is_err());
+    }
+
+    #[test]
+    fn anchor_preferences_accept_all_names_and_fall_back_to_top_center() {
+        for (name, expected) in [
+            ("top-center", crate::app::geometry::Anchor::TopCenter),
+            ("center", crate::app::geometry::Anchor::Center),
+            ("top-left", crate::app::geometry::Anchor::TopLeft),
+            ("top-right", crate::app::geometry::Anchor::TopRight),
+        ] {
+            let preferences = apply_preferences(Preferences::default(), &json!({"anchor": name})).unwrap();
+            assert_eq!(preferences.anchor, Some(expected));
+        }
+        let fallback = apply_preferences(Preferences::default(), &json!({"anchor": "elsewhere"})).unwrap();
+        assert_eq!(fallback.anchor, Some(crate::app::geometry::Anchor::TopCenter));
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_effective_ball_settings() {
+        let session = Session::new(Identity {
+            quorfloat_version: "test".to_owned(),
+            platform: "darwin".to_owned(),
+            arch: "arm64".to_owned(),
+            hotkey: HotkeyReport { requested: String::new(), registered: false },
+        });
+        let shell = ShellView {
+            settings: WindowSettings {
+                floating_ball: true,
+                ball_logo: LOGO.to_owned(),
+                ..WindowSettings::default()
+            },
+            preferences: Preferences::default(),
+            hotkey_requested: None,
+            hotkey_held: None,
+            hotkey_registered: false,
+            hotkey_reason: None,
+            visible: false,
+            height: Height::new(),
+            summon_token: "test".to_owned(),
+            summon_count: 0,
+        };
+        let state = snapshot(&session, &shell);
+        assert_eq!(state["settings"]["floatingBall"], json!(true));
+        assert_eq!(state["settings"]["ballLogo"], json!(LOGO));
+        assert_eq!(state["settings"]["anchor"], json!("top-center"));
+    }
+}

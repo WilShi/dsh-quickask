@@ -1,0 +1,36 @@
+@import '../styles/tokens.css';
+
+html,
+body,
+#ball {
+  width: 100%;
+  height: 100%;
+}
+
+#ball {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 50%;
+  clip-path: circle(50%);
+  background: transparent;
+  cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#ball:hover {
+  background: transparent;
+}
+
+#ball img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}

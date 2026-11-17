@@ -1,0 +1,31 @@
+# rust
+# cargo 构建产物
+target/
+
+# 本地工具残留
+# rustfmt 改写文件前留下的备份。
+**/*.rs.bk
+
+# `cargo update` 失败时留下的旧锁文件。
+Cargo.lock.orig
+
+# 编辑器
+.rustfmt.toml.local
+rust-analyzer.json
+
+# 平台产物
+/dsh-quorfloat.exe
+/dsh-quorfloat.pdb
+
+
+# tauri-build 生成的 schema
+/gen/
+
+.npm-cache/
+node_modules/
+
+# npm run build:frontend 的产物
+/frontend/dist/
+
+# npm run build:frontend 的构建临时目录（vite.config.ts 把 TMPDIR/TEMP/TMP 指到这里）
+/frontend/.tmp/

@@ -1,0 +1,41 @@
+{
+  "productName": "dsh-quorfloat",
+  "identifier": "dev.dsh.quorfloat",
+  "build": {
+    "frontendDist": "frontend/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "style-src-attr": "'unsafe-inline'",
+        "img-src": "'self' http: https: blob:",
+        "font-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost https://ipc.localhost",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "style-src-attr": "'unsafe-inline'",
+        "img-src": "'self' http: https: blob:",
+        "font-src": "'self'",
+        "connect-src": "'self' ipc: http://ipc.localhost https://ipc.localhost ws://localhost:5173 ws://127.0.0.1:5173",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  }
+}

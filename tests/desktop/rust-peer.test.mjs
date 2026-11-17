@@ -1,0 +1,826 @@
+// Category 1 (cross-process protocol): the host↔sidecar wire against the real Rust binary.
+// Desktop integration suite: requires a local window server and WebView runtime.
+/**
+ * Cross-language handshake: the real host plugin against the real Rust binary.
+ *
+ * Everything on the host side is the shipping implementation — `QuorfloatSupervisor`
+ * spawns the process, `QuorfloatChannel` frames it, and `HostRouter` validates the
+ * `hello`. Only the binary path is substituted, so this test answers the question
+ * the two sides cannot answer separately: *do they agree about the wire?*
+ *
+ * It exists because the alternative is finding out from a handshake timeout in a
+ * packaged app, where the failure looks identical to a binary that never started.
+ * A parameter name that does not match its descriptor is the same class of bug,
+ * and this catches it before it ships.
+ *
+ * Skipped when the Rust binary has not been built, so the suite stays runnable
+ * from a clean clone. `cargo build` in `quorfloat/` enables it.
+ */
+
+import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import { after, before, test } from 'node:test'
+import { join } from 'node:path'
+
+import { buildSupervisor, repoRoot, sleep, waitFor } from '../helpers.mjs'
+
+/**
+ * The sidecar's own state files and the variable that names where each one lives.
+ *
+ * It keeps all of them under `~/.dsh-quorfloat` unless the environment says otherwise,
+ * and reads them at startup. A developer's real files must not decide this suite's
+ * outcome: a real pin makes the panel attach to that conversation as it starts, which is
+ * a true fact about that home and a false one about the wire — the "attaches to nothing"
+ * test below then fails on code that is correct. The redirect below points every path at
+ * one scratch directory instead, so this file measures the protocol and nothing about
+ * whose machine it runs on. The user's real files are never written to; they are simply
+ * never read.
+ *
+ * The names are the state-file variables `quorfloat/src/` actually reads — `app/pinned.rs`,
+ * `app/preferences.rs`, `app/geometry.rs` and the marker sink in `runtime/diag/` — so a new
+ * state file has to be added here too or the suite stops being hermetic. A variable the sidecar
+ * does not honour cannot fail loudly; the guard is reading those four modules.
+ */
+const stateFiles = {
+  // The pinned conversation, and the workspace half beside it.
+  DSH_QUORFLOAT_PINNED: 'pinned.json',
+  // The panel's own remembered settings (hotkey, keep-open, language, theme).
+  DSH_QUORFLOAT_PREFERENCES: 'preferences.json',
+  // Where the window remembers its position.
+  DSH_QUORFLOAT_WINDOW_STATE: 'window.json',
+  // Off unless named, but a marker path inherited from the caller's shell is one more
+  // real file this run would otherwise append to. Tests that read a marker point this
+  // at their own file and delete it afterwards.
+  DSH_QUORFLOAT_RUST_MARKER: 'marker.log',
+}
+
+/** This run's scratch directory for the paths above. */
+let stateDirectory
+/** The caller's values, restored when the file is done so nothing leaks sideways. */
+const callerState = new Map()
+
+before(async () => {
+  const { mkdtemp } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  stateDirectory = await mkdtemp(join(tmpdir(), 'quorfloat-state-'))
+  for (const [variable, name] of Object.entries(stateFiles)) {
+    callerState.set(variable, process.env[variable])
+    // The supervisor forwards every `DSH_QUORFLOAT_*` variable from its own environment
+    // to the child, so setting it here is what reaches the sidecar.
+    process.env[variable] = join(stateDirectory, name)
+  }
+})
+
+after(async () => {
+  const { rm } = await import('node:fs/promises')
+  for (const [variable, value] of callerState) {
+    if (value === undefined) delete process.env[variable]
+    else process.env[variable] = value
+  }
+  // `before` is the only thing that creates it, and an `after` hook still runs when
+  // that failed; removing a directory never created must not become the failure.
+  if (stateDirectory !== undefined) await rm(stateDirectory, { recursive: true, force: true })
+})
+
+/** Where `cargo build` leaves the binary, newest profile first. */
+function rustBinary() {
+  // Cargo appends `.exe` on Windows; without it every protocol test would skip
+  // there and the host↔sidecar wire would go unexercised on the platform the
+  // release is verified on.
+  const executable = process.platform === 'win32' ? 'dsh-quorfloat.exe' : 'dsh-quorfloat'
+  const candidates = [
+    join(repoRoot, 'quorfloat/target/debug', executable),
+    join(repoRoot, 'quorfloat/target/release', executable),
+  ]
+  return candidates.find(candidate => existsSync(candidate))
+}
+
+const binary = rustBinary()
+const skip = binary === undefined
+  ? 'the Rust binary is not built; run `cargo build` in quorfloat/'
+  : false
+
+/**
+ * The version the Rust binary embeds, read from the crate manifest it was built from.
+ *
+ * `quorfloat/src/lib.rs` reports `env!("CARGO_PKG_VERSION")`, and cargo fills that from
+ * `[package] version` here — so this is the value the handshake has to carry. Reading it
+ * rather than retyping it is what keeps the assertion below a statement about the wire
+ * instead of a number to bump at every release; `scripts/version.mjs` refuses a release
+ * when this file and the root `package.json` disagree, so the two halves cannot drift
+ * apart behind it. Do not "simplify" this back into a literal.
+ */
+function crateVersion() {
+  let inPackageTable = false
+  for (const line of readFileSync(join(repoRoot, 'quorfloat/Cargo.toml'), 'utf8').split('\n')) {
+    const table = /^\s*\[([^\]]+)\]\s*$/u.exec(line)
+    if (table !== null) {
+      inPackageTable = table[1] === 'package'
+      continue
+    }
+    // Only this table holds the crate's own version: the `[dependencies]` entries
+    // below spell `version = ...` too, and one of those is the Tauri shell's.
+    if (!inPackageTable) continue
+    const found = /^version\s*=\s*"([^"]+)"\s*$/u.exec(line)?.[1]
+    if (found !== undefined) return found
+  }
+  throw new Error('quorfloat/Cargo.toml declares no [package] version')
+}
+
+/** Start the real supervisor against the real Rust binary. */
+async function start(config = {}) {
+  const app = await buildSupervisor({
+    config: { heartbeatMs: 200, startupTimeoutMs: 8000, ...config },
+    deps: {
+      // Only the executable is swapped; the resolver's own path handling is
+      // already covered elsewhere.
+      routerHost: {},
+    },
+  })
+  return app
+}
+
+test('the real supervisor completes a handshake with the Rust binary', { skip }, async t => {
+  const { QuorfloatSupervisor } = await import(new URL('../../lib/host/supervisor.js', import.meta.url))
+  const { HostRouter } = await import(new URL('../../lib/bridge/router.js', import.meta.url))
+  const { DEFAULT_CONFIG } = await import(new URL('../../lib/config.js', import.meta.url))
+
+  const effective = {
+    ...DEFAULT_CONFIG,
+    heartbeatMs: 200,
+    heartbeatMissLimit: 3,
+    startupTimeoutMs: 8000,
+    shutdownGraceMs: 1000,
+    logLevel: 'debug',
+  }
+  const events = []
+  const logLines = []
+  // The router is constructed by the supervisor and not exposed, so the recorded
+  // handshake is read through the diagnostics hook the router already calls —
+  // an existing observation point rather than a new test-only method.
+  let recordedHandshake
+  let router
+  const logger = {
+    info: (...args) => logLines.push(['info', ...args]),
+    warn: (...args) => logLines.push(['warn', ...args]),
+    debug: () => {},
+    error: (...args) => logLines.push(['error', ...args]),
+  }
+  // A purposely unparseable accelerator, so the "not registered" assertion below
+  // tests this crate's reporting rather than whether the machine's Alt+Space
+  // happens to be free. A real registration is covered separately.
+  process.env['DSH_QUORFLOAT_HOTKEY'] = 'Alt+Banana'
+  const supervisor = new QuorfloatSupervisor({
+    config: () => effective,
+    resolveBinary: () => ({ path: binary, args: [], source: 'config', attempts: [] }),
+    createRouter: channelSessionId => {
+      router = new HostRouter({
+        config: () => effective,
+        channelSessionId: () => channelSessionId,
+        hostVersion: () => 'cross-language-test',
+        listWorkspaces: async () => ({ items: [] }),
+        listSessions: async () => ({ items: [] }),
+        createSession: async () => ({ sessionId: 's' }),
+        attachSession: async sessionId => ({ sessionId }),
+        readHistory: async () => ({ records: [], hasMore: false }),
+        prompt: async () => ({ accepted: true }),
+        cancel: async () => ({ accepted: true }),
+        answerInteraction: async () => ({ accepted: true }),
+        reportPresence: async () => ({ accepted: true }),
+        diagnostics: () => {
+          recordedHandshake = router?.snapshotForTest?.() ?? recordedHandshake
+          return {}
+        },
+      })
+      return router
+    },
+    log: logger,
+    onEvent: event => events.push(event),
+  })
+
+  try {
+    await supervisor.start()
+    await waitFor(
+      'the Rust binary to be accepted as running',
+      async () => supervisor.snapshot().state === 'running',
+      { timeoutMs: 10000 },
+    )
+    const snapshot = supervisor.snapshot()
+    assert.equal(snapshot.handshaken, true, 'the host accepted our hello')
+
+    // Read what the *host recorded about the peer*, which is the peer's own
+    // report. The handshake event carries the host's answer instead, so asserting
+    // on it would test the host's constants rather than the Rust side's facts.
+    // Ask the router for its snapshot directly: `diag/snapshot` includes the
+    // handshake facts it recorded from our `hello`.
+    const diagnostics = await router.handle('diag/snapshot', {})
+    const recorded = diagnostics.handshake
+    assert.ok(recorded !== null && recorded !== undefined, 'the host recorded a handshake')
+    assert.equal(recorded.protocol, 'quorfloat/1')
+    assert.equal(recorded.quorfloatVersion, crateVersion())
+    // The wire carries the *host's* vocabulary, so these are compared against
+    // Node's own constants rather than Rust's: `macos`/`aarch64` would be valid
+    // facts spelled uselessly, and nothing on the host branches on them.
+    assert.equal(recorded.platform, process.platform, 'platform uses process.platform spelling')
+    assert.equal(recorded.arch, process.arch, 'arch uses process.arch spelling')
+    // `question` is declared because the panel can draw the option widgets: the
+    // declaration is a promise that claiming a question will not hide it from the
+    // Harness window for nothing.
+    assert.deepEqual(recorded.capabilities, ['window', 'hotkey', 'tauri', 'approval', 'question'])
+    // The same fact through the supervisor, because that is the path the plugin's
+    // claim gate reads. A declaration the snapshot failed to carry would silently
+    // defer every approval to the Harness window while the real binary was ready to
+    // render it.
+    assert.deepEqual(supervisor.snapshot().peerCapabilities, ['window', 'hotkey', 'tauri', 'approval', 'question'])
+    // The reported flag is the *real* outcome of the grab, which is what makes a
+    // conflict visible in the host's settings surface instead of leaving the user
+    // pressing a key that does nothing.
+    assert.equal(recorded.hotkey.registered, false, 'an unparseable accelerator cannot register')
+    assert.equal(recorded.hotkey.requested, 'Alt+Banana', 'the requested accelerator is reported verbatim')
+
+    // Liveness is judged by `ping`, so surviving several heartbeats is the proof
+    // that the Rust read loop is actually answering rather than merely alive.
+    // `heartbeatMs` is 200 here, so ~900ms covers several rounds.
+    await sleep(900)
+    const after = supervisor.snapshot()
+    assert.equal(after.state, 'running', 'still running after several heartbeats')
+    assert.equal(after.consecutiveMissedHeartbeats, 0, 'every ping was answered')
+    assert.equal(after.rejectedFrames, 0, 'the host rejected none of our frames, in either direction')
+  } catch (error) {
+    t.diagnostic(JSON.stringify({ snapshot: supervisor.snapshot(), logLines }))
+    throw error
+  } finally {
+    const result = await supervisor.stop()
+    if (!result.exited || result.escalated || result.code !== 0) {
+      t.diagnostic(JSON.stringify({ shutdown: result, logLines }))
+    }
+    assert.equal(result.exited, true, 'the binary exited when asked')
+    assert.equal(result.escalated, false, 'it exited on the shutdown request, without SIGTERM')
+    assert.equal(result.code, 0, `clean exit, got code ${result.code} signal ${result.signal}`)
+  }
+})
+
+test('the Rust binary exits on stdin EOF instead of lingering', { skip }, async () => {
+  // The host's cleanup is judged by observed process exit. A peer that ignored a
+  // closed stdin would be killed by escalation, which is exactly the evidence the
+  // host refuses to accept as a clean shutdown.
+  const { spawn } = await import('node:child_process')
+  const child = spawn(binary, [], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const stdout = []
+  child.stdout.on('data', chunk => stdout.push(String(chunk)))
+
+  // Answer the handshake so the process is not sitting in its startup path.
+  await waitFor('the hello frame', async () => stdout.join('').includes('"hello"'), { timeoutMs: 5000 })
+  const first = JSON.parse(stdout.join('').split('\n')[0])
+  assert.equal(first.method, 'hello')
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocol: 'quorfloat/1' } })}\n`)
+  await sleep(150)
+
+  const exited = new Promise(resolve => child.on('exit', (code, signal) => resolve({ code, signal })))
+  child.stdin.end()
+  const { code, signal } = await exited
+  assert.equal(signal, null, 'it exited on its own, not by signal')
+  assert.equal(code, 0)
+})
+
+test('a real accelerator registers and the session stays healthy', { skip }, async () => {
+  // The positive half of the hotkey contract. An accelerator unlikely to be taken
+  // is chosen so the test measures this crate rather than the machine's luck, and
+  // the assertion is on the whole session: a registration that broke the event
+  // loop would be worse than one that failed.
+  process.env['DSH_QUORFLOAT_HOTKEY'] = 'Control+Alt+Shift+F13'
+  const { QuorfloatSupervisor } = await import(new URL('../../lib/host/supervisor.js', import.meta.url))
+  const { HostRouter } = await import(new URL('../../lib/bridge/router.js', import.meta.url))
+  const { DEFAULT_CONFIG } = await import(new URL('../../lib/config.js', import.meta.url))
+  const effective = {
+    ...DEFAULT_CONFIG,
+    heartbeatMs: 200,
+    heartbeatMissLimit: 3,
+    startupTimeoutMs: 8000,
+    shutdownGraceMs: 1000,
+    logLevel: 'debug',
+  }
+  let recorded
+  const supervisor = new QuorfloatSupervisor({
+    config: () => effective,
+    resolveBinary: () => ({ path: binary, args: [], source: 'config', attempts: [] }),
+    createRouter: channelSessionId =>
+      new HostRouter({
+        config: () => effective,
+        channelSessionId: () => channelSessionId,
+        hostVersion: () => 'cross-language-test',
+        listWorkspaces: async () => ({ items: [] }),
+        listSessions: async () => ({ items: [] }),
+        createSession: async () => ({ sessionId: 's' }),
+        attachSession: async sessionId => ({ sessionId }),
+        readHistory: async () => ({ records: [], hasMore: false }),
+        prompt: async () => ({ accepted: true }),
+        cancel: async () => ({ accepted: true }),
+        answerInteraction: async () => ({ accepted: true }),
+        reportPresence: async () => ({ accepted: true }),
+        diagnostics: () => ({}),
+      }),
+    log: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+    onEvent: () => {},
+  })
+  try {
+    await supervisor.start()
+    await waitFor('running', async () => supervisor.snapshot().state === 'running', { timeoutMs: 10000 })
+    const handshake = supervisor.snapshot().hotkey
+    assert.ok(handshake !== null, 'the host recorded a hotkey report')
+    assert.equal(handshake.requested, 'Control+Alt+Shift+F13')
+    recorded = handshake.registered
+    await sleep(700)
+    assert.equal(supervisor.snapshot().state, 'running', 'registration did not disturb the loop')
+    assert.equal(supervisor.snapshot().consecutiveMissedHeartbeats, 0, 'pings are still answered')
+  } finally {
+    delete process.env['DSH_QUORFLOAT_HOTKEY']
+    const result = await supervisor.stop()
+    assert.equal(result.exited, true)
+    assert.equal(result.escalated, false)
+    // Reported because a headless CI machine may legitimately have no window server,
+    // and failing there would say nothing about the code.
+    console.log(`hotkey registered on this machine: ${String(recorded)}`)
+  }
+})
+
+test('the sidecar reports a measured window capability and its hidden start', { skip }, async () => {
+  // The point here: the peer must not claim a window it has
+  // not created. `hello` is written before any window exists, so the claim has to
+  // come later — and this checks it arrives, and arrives honest.
+  process.env['DSH_QUORFLOAT_HOTKEY'] = 'Control+Alt+Shift+F13'
+  const { QuorfloatSupervisor } = await import(new URL('../../lib/host/supervisor.js', import.meta.url))
+  const { HostRouter } = await import(new URL('../../lib/bridge/router.js', import.meta.url))
+  const { DEFAULT_CONFIG } = await import(new URL('../../lib/config.js', import.meta.url))
+  const effective = {
+    ...DEFAULT_CONFIG,
+    heartbeatMs: 200,
+    heartbeatMissLimit: 3,
+    startupTimeoutMs: 8000,
+    shutdownGraceMs: 1000,
+    logLevel: 'debug',
+  }
+  const supervisor = new QuorfloatSupervisor({
+    config: () => effective,
+    resolveBinary: () => ({ path: binary, args: [], source: 'config', attempts: [] }),
+    createRouter: channelSessionId =>
+      new HostRouter({
+        config: () => effective,
+        channelSessionId: () => channelSessionId,
+        hostVersion: () => 'cross-language-test',
+        listWorkspaces: async () => ({ items: [] }),
+        listSessions: async () => ({ items: [] }),
+        createSession: async () => ({ sessionId: 's' }),
+        attachSession: async sessionId => ({ sessionId }),
+        readHistory: async () => ({ records: [], hasMore: false }),
+        prompt: async () => ({ accepted: true }),
+        cancel: async () => ({ accepted: true }),
+        answerInteraction: async () => ({ accepted: true }),
+        reportPresence: async () => ({ accepted: true }),
+        diagnostics: () => ({}),
+      }),
+    log: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+    onEvent: () => {},
+  })
+  try {
+    await supervisor.start()
+    await waitFor('running', async () => supervisor.snapshot().state === 'running', { timeoutMs: 10000 })
+    // The startup report is sent as soon as the window exists, which is the first
+    // thing that happens after the handshake.
+    await waitFor(
+      'a window capability report',
+      async () => supervisor.snapshot().panelCapabilities.length > 0,
+      { timeoutMs: 8000 },
+    )
+    const snapshot = supervisor.snapshot()
+    assert.ok(
+      snapshot.panelCapabilities.includes('window'),
+      `the window exists, so it is reported: ${JSON.stringify(snapshot.panelCapabilities)}`,
+    )
+    assert.ok(snapshot.panelCapabilities.includes('hotkey'), 'and the hotkey registration succeeded')
+    assert.equal(snapshot.panelVisible, false, 'the panel starts hidden and says so')
+  } finally {
+    delete process.env['DSH_QUORFLOAT_HOTKEY']
+    const result = await supervisor.stop()
+    assert.equal(result.exited, true)
+    assert.equal(result.escalated, false)
+  }
+})
+
+test('the real host publishes an approval the panel records as a card', { skip }, async () => {
+  // The delivery half of the approval path, over the real wire. What cannot be tested here is the
+  // click that answers it — that needs a human and a window — so this asserts the
+  // part a machine can: the frame leaves the host's real channel, is framed by the
+  // real Rust reader, parsed by the real session, and turned into a card.
+  //
+  // Observed through the marker file rather than the host's logs, because the host
+  // captures the peer's stderr and never shows it. `DSH_QUORFLOAT_RUST_MARKER` is
+  // the one surface a developer or a test can read afterwards.
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const directory = await mkdtemp(join(tmpdir(), 'quorfloat-marker-'))
+  const markerPath = join(directory, 'marker.log')
+
+  process.env['DSH_QUORFLOAT_RUST_MARKER'] = markerPath
+  process.env['DSH_QUORFLOAT_HOTKEY'] = 'Alt+Banana'
+  const { QuorfloatSupervisor } = await import(new URL('../../lib/host/supervisor.js', import.meta.url))
+  const { HostRouter } = await import(new URL('../../lib/bridge/router.js', import.meta.url))
+  const { DEFAULT_CONFIG } = await import(new URL('../../lib/config.js', import.meta.url))
+  const effective = {
+    ...DEFAULT_CONFIG,
+    heartbeatMs: 200,
+    heartbeatMissLimit: 3,
+    startupTimeoutMs: 8000,
+    shutdownGraceMs: 1000,
+    logLevel: 'debug',
+  }
+  const supervisor = new QuorfloatSupervisor({
+    config: () => effective,
+    resolveBinary: () => ({ path: binary, args: [], source: 'config', attempts: [] }),
+    createRouter: channelSessionId =>
+      new HostRouter({
+        config: () => effective,
+        channelSessionId: () => channelSessionId,
+        hostVersion: () => 'cross-language-test',
+        listWorkspaces: async () => ({ items: [] }),
+        listSessions: async () => ({ items: [] }),
+        createSession: async () => ({ sessionId: 's' }),
+        attachSession: async sessionId => ({ sessionId }),
+        readHistory: async () => ({ records: [], hasMore: false }),
+        prompt: async () => ({ accepted: true }),
+        cancel: async () => ({ accepted: true }),
+        answerInteraction: async () => ({ accepted: true }),
+        reportPresence: async () => ({ accepted: true }),
+        diagnostics: () => ({}),
+      }),
+    log: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+    onEvent: () => {},
+  })
+
+  /** Everything the binary has written so far. */
+  const breadcrumbs = async () => {
+    try {
+      return await readFile(markerPath, 'utf8')
+    } catch {
+      return ''
+    }
+  }
+
+  try {
+    await supervisor.start()
+    await waitFor('running', async () => supervisor.snapshot().state === 'running', { timeoutMs: 10000 })
+    await waitFor('the startup breadcrumb', async () => (await breadcrumbs()).includes('start'))
+
+    // The host's own payload shape, exactly as `Interactions` publishes it.
+    const published = await supervisor.notify('interaction/open', {
+      interactionId: 'approval-cross-1',
+      sessionId: 'session-cross',
+      kind: 'approval',
+      payload: {
+        toolName: 'bash',
+        callId: 'call-1',
+        reason: 'escalate sandbox to danger-full-access: cross-language test',
+        displayReason: { zh: '允许本次操作使用 danger-full-access 权限：跨语言测试' },
+      },
+    })
+    assert.equal(published, true, 'the host wrote the notification')
+
+    await waitFor(
+      'the panel to record the card',
+      async () => (await breadcrumbs()).includes('interaction approval-cross-1 approval arrived'),
+      { timeoutMs: 8000 },
+    )
+
+    // A hint is a different animal: no card, no id, and it must not be answerable.
+    await supervisor.notify('interaction/hint', {
+      sessionId: 'session-cross',
+      kind: 'question',
+      reason: 'harness-not-visible',
+      surfaces: ['desktop'],
+    })
+    await waitFor(
+      'the panel to record the hand-off',
+      async () => (await breadcrumbs()).includes('handoff question harness-not-visible surfaces=1'),
+      { timeoutMs: 8000 },
+    )
+    const written = await breadcrumbs()
+    assert.ok(
+      !written.includes('interaction approval-cross-1 answering'),
+      'nothing was answered: a card waits for a human, and no human clicked',
+    )
+
+    // Now paint them. A hidden window never runs the drawing code, so this is the
+    // only test that exercises the card layout against real payloads — including the
+    // question card, which has no answer widgets and must still lay out text the
+    // peer chose the length of.
+    await supervisor.notify('interaction/open', {
+      interactionId: 'question-cross-1',
+      sessionId: 'session-cross',
+      kind: 'question',
+      payload: {
+        questions: [
+          { id: 'q1', header: '部署目标', question: '部署到哪个环境？', options: [{ label: 'staging' }] },
+          { id: 'q2', question: '需要通知谁？' },
+        ],
+      },
+    })
+    await waitFor(
+      'the panel to record the question',
+      async () => (await breadcrumbs()).includes('interaction question-cross-1 question arrived'),
+      { timeoutMs: 8000 },
+    )
+
+    assert.equal(await supervisor.setPanelVisible(true), true)
+    await waitFor(
+      'the panel to report itself visible',
+      async () => supervisor.snapshot().panelVisible === true,
+      { timeoutMs: 8000 },
+    )
+    // Several frames' worth, so the cards are laid out rather than merely queued.
+    await sleep(400)
+    assert.equal(supervisor.snapshot().state, 'running', 'drawing the cards did not take the loop down')
+    await supervisor.setPanelVisible(false)
+    await waitFor(
+      'the panel to hide again',
+      async () => supervisor.snapshot().panelVisible === false,
+      { timeoutMs: 8000 },
+    )
+
+    // The session stayed healthy throughout, which is what says the frames were
+    // parsed rather than merely delivered.
+    assert.equal(supervisor.snapshot().consecutiveMissedHeartbeats, 0, 'pings were answered throughout')
+  } finally {
+    delete process.env['DSH_QUORFLOAT_RUST_MARKER']
+    delete process.env['DSH_QUORFLOAT_HOTKEY']
+    const result = await supervisor.stop()
+    assert.equal(result.exited, true)
+    assert.equal(result.escalated, false)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('the panel reads the conversation list and attaches to nothing on its own', { skip }, async () => {
+  // A panel attaches to the conversation the user pinned or chose, and otherwise waits
+  // to be given something to say (the conversation is created when they submit). Asserted
+  // here because it is a claim about two programs: the host must still be asked what
+  // exists, and must not be asked to attach to anything until a person decides.
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const directory = await mkdtemp(join(tmpdir(), 'quorfloat-follow-'))
+  const markerPath = join(directory, 'marker.log')
+
+  process.env['DSH_QUORFLOAT_RUST_MARKER'] = markerPath
+  process.env['DSH_QUORFLOAT_HOTKEY'] = 'Alt+Banana'
+  const { QuorfloatSupervisor } = await import(new URL('../../lib/host/supervisor.js', import.meta.url))
+  const { HostRouter } = await import(new URL('../../lib/bridge/router.js', import.meta.url))
+  const { DEFAULT_CONFIG } = await import(new URL('../../lib/config.js', import.meta.url))
+  const effective = {
+    ...DEFAULT_CONFIG,
+    heartbeatMs: 200,
+    heartbeatMissLimit: 3,
+    startupTimeoutMs: 8000,
+    shutdownGraceMs: 1000,
+    logLevel: 'debug',
+  }
+  /** Every session the binary asked to attach, in order. */
+  const attaches = []
+  let listCalls = 0
+  const supervisor = new QuorfloatSupervisor({
+    config: () => effective,
+    resolveBinary: () => ({ path: binary, args: [], source: 'config', attempts: [] }),
+    createRouter: channelSessionId =>
+      new HostRouter({
+        config: () => effective,
+        channelSessionId: () => channelSessionId,
+        hostVersion: () => 'cross-language-test',
+        listWorkspaces: async () => ({ items: [] }),
+        listSessions: async () => {
+          listCalls += 1
+          // Deliberately not in "newest first" order: the choice is by `updatedAt`,
+          // which is the only ordering the protocol actually promises.
+          return {
+            items: [
+              { sessionId: 'session-older', cwd: '/work/project', updatedAt: 10, running: false, blank: false },
+              { sessionId: 'session-newest', cwd: '/work/project', updatedAt: 90, running: true, blank: false },
+            ],
+          }
+        },
+        createSession: async () => ({ sessionId: 's' }),
+        attachSession: async sessionId => {
+          attaches.push(sessionId)
+          return { sessionId, generation: 7, replaced: false }
+        },
+        readHistory: async () => ({ records: [], hasMore: false }),
+        prompt: async () => ({ accepted: true }),
+        cancel: async () => ({ accepted: true }),
+        answerInteraction: async () => ({ accepted: true }),
+        reportPresence: async () => ({ accepted: true }),
+        diagnostics: () => ({}),
+      }),
+    log: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+    onEvent: () => {},
+  })
+
+  try {
+    await supervisor.start()
+    await waitFor('running', async () => supervisor.snapshot().state === 'running', { timeoutMs: 10000 })
+    // The list is read — the picker draws it, and a pinned conversation is validated against
+    // it — and no attach follows, however busy the conversations in it are.
+    await waitFor('the panel to read the conversation list', async () => listCalls >= 1, { timeoutMs: 10000 })
+    assert.deepEqual(attaches, [], 'nothing is attached without a decision')
+
+    // And the record says the same thing: whatever the list contained, the panel never claims
+    // to be following anything — which is the durable evidence that it is waiting for a person
+    // rather than for the host to touch another conversation.
+    const marker = await readFile(markerPath, 'utf8').catch(() => '')
+    assert.ok(!marker.includes('follow '), `nothing is claimed as followed: ${marker}`)
+
+    // The list is kept by pushes, and a push that cannot be represented as a merge still asks
+    // for the authoritative answer. This is the cross-process half of that: the real sidecar
+    // reads the frame the host writes and asks again before the 30-second reconcile could.
+    await supervisor.notify('sessions/changed', { type: 'refresh', reason: 'removed' })
+    await waitFor('the pushed reconciliation to ask again', async () => listCalls >= 2, { timeoutMs: 5000 })
+    assert.deepEqual(attaches, [], 'and the steady state still attaches to nothing')
+
+    // A whole-row push is applied in place: it must not make the panel attach either.
+    await supervisor.notify('sessions/changed', {
+      type: 'upsert',
+      session: { sessionId: 'session-pushed', cwd: '/work/project', updatedAt: 100, running: true, blank: false },
+    })
+    // The marker is the sidecar's own record, and it is what proves the push was applied
+    // rather than merely received.
+    await waitFor('the pushed row to be applied', async () => {
+      const text = await readFile(markerPath, 'utf8').catch(() => '')
+      return text.includes('sessions changed: upsert session-pushed')
+    }, { timeoutMs: 5000 })
+    assert.deepEqual(attaches, [], 'a pushed row is not a user decision')
+
+    assert.equal(supervisor.snapshot().consecutiveMissedHeartbeats, 0, 'the push did not disturb liveness')
+  } finally {
+    delete process.env['DSH_QUORFLOAT_RUST_MARKER']
+    delete process.env['DSH_QUORFLOAT_HOTKEY']
+    const result = await supervisor.stop()
+    assert.equal(result.exited, true)
+    assert.equal(result.escalated, false)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('the host can ask the sidecar to show and hide its window', { skip }, async () => {
+  // The direction that was missing. Asserted through the peer's own report rather
+  // than a promise, because the command is a notification: the host learns the
+  // result the same way it learns everything else about the panel's state.
+  const { QuorfloatSupervisor } = await import(new URL('../../lib/host/supervisor.js', import.meta.url))
+  const { HostRouter } = await import(new URL('../../lib/bridge/router.js', import.meta.url))
+  const { DEFAULT_CONFIG } = await import(new URL('../../lib/config.js', import.meta.url))
+  const effective = {
+    ...DEFAULT_CONFIG,
+    heartbeatMs: 200,
+    heartbeatMissLimit: 3,
+    startupTimeoutMs: 8000,
+    shutdownGraceMs: 1000,
+    logLevel: 'debug',
+  }
+  const supervisor = new QuorfloatSupervisor({
+    config: () => effective,
+    resolveBinary: () => ({ path: binary, args: [], source: 'config', attempts: [] }),
+    createRouter: channelSessionId =>
+      new HostRouter({
+        config: () => effective,
+        channelSessionId: () => channelSessionId,
+        hostVersion: () => 'cross-language-test',
+        listWorkspaces: async () => ({ items: [] }),
+        listSessions: async () => ({ items: [] }),
+        createSession: async () => ({ sessionId: 's' }),
+        attachSession: async sessionId => ({ sessionId }),
+        readHistory: async () => ({ records: [], hasMore: false }),
+        prompt: async () => ({ accepted: true }),
+        cancel: async () => ({ accepted: true }),
+        answerInteraction: async () => ({ accepted: true }),
+        reportPresence: async () => ({ accepted: true }),
+        diagnostics: () => ({}),
+      }),
+    log: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+    onEvent: () => {},
+  })
+  try {
+    await supervisor.start()
+    await waitFor('running', async () => supervisor.snapshot().state === 'running', { timeoutMs: 10000 })
+    await waitFor('the opening report', async () => supervisor.snapshot().panelVisible === false)
+
+    assert.equal(await supervisor.setPanelVisible(true), true, 'the command was written')
+    await waitFor(
+      'the panel to report itself visible',
+      async () => supervisor.snapshot().panelVisible === true,
+      { timeoutMs: 8000 },
+    )
+
+    assert.equal(await supervisor.setPanelVisible(false), true)
+    await waitFor(
+      'the panel to report itself hidden again',
+      async () => supervisor.snapshot().panelVisible === false,
+      { timeoutMs: 8000 },
+    )
+  } finally {
+    const result = await supervisor.stop()
+    assert.equal(result.exited, true)
+    assert.equal(result.escalated, false)
+  }
+})
+
+test('the real sidecar folds a conversation and a stream over the real wire', { skip }, async () => {
+  // The transcript half of the conversation flow, over the real wire: the frames
+  // leave the host's channel, are framed by the real Rust reader, and folded by
+  // the real session into entries — the state the frontend renders from.
+  // Observed through the marker, the one surface readable after the fact.
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const directory = await mkdtemp(join(tmpdir(), 'quorfloat-marker-'))
+  const markerPath = join(directory, 'marker.log')
+
+  process.env['DSH_QUORFLOAT_RUST_MARKER'] = markerPath
+  process.env['DSH_QUORFLOAT_HOTKEY'] = 'Alt+Banana'
+  const { QuorfloatSupervisor } = await import(new URL('../../lib/host/supervisor.js', import.meta.url))
+  const { HostRouter } = await import(new URL('../../lib/bridge/router.js', import.meta.url))
+  const { DEFAULT_CONFIG } = await import(new URL('../../lib/config.js', import.meta.url))
+  const effective = {
+    ...DEFAULT_CONFIG,
+    heartbeatMs: 200,
+    heartbeatMissLimit: 3,
+    startupTimeoutMs: 8000,
+    shutdownGraceMs: 1000,
+    logLevel: 'debug',
+  }
+  const supervisor = new QuorfloatSupervisor({
+    config: () => effective,
+    resolveBinary: () => ({ path: binary, args: [], source: 'config', attempts: [] }),
+    createRouter: channelSessionId =>
+      new HostRouter({
+        config: () => effective,
+        channelSessionId: () => channelSessionId,
+        hostVersion: () => 'cross-language-test',
+        listWorkspaces: async () => ({ items: [] }),
+        listSessions: async () => ({ items: [] }),
+        createSession: async () => ({ sessionId: 's' }),
+        attachSession: async sessionId => ({ sessionId }),
+        readHistory: async () => ({ records: [], hasMore: false }),
+        prompt: async () => ({ accepted: true }),
+        cancel: async () => ({ accepted: true }),
+        answerInteraction: async () => ({ accepted: true }),
+        reportPresence: async () => ({ accepted: true }),
+        diagnostics: () => ({}),
+      }),
+    log: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+    onEvent: () => {},
+  })
+  const breadcrumbs = async () => {
+    try {
+      return await readFile(markerPath, 'utf8')
+    } catch {
+      return ''
+    }
+  }
+
+  try {
+    await supervisor.start()
+    await waitFor('running', async () => supervisor.snapshot().state === 'running', { timeoutMs: 10000 })
+
+    // A snapshot carrying one real user message, in the harness's unwrapped shape.
+    await supervisor.notify('session/snapshot', {
+      sessionId: 'session-cross',
+      generation: 1,
+      cursor: 0,
+      hasMore: false,
+      records: [
+        { type: 'event', event: { type: 'user/message', seq: 0, time: 1,
+          data: { role: 'user', content: [{ type: 'text', text: '跨语言折叠测试' }] } } },
+      ],
+    })
+    await waitFor(
+      'the transcript to fold the record',
+      async () => (await breadcrumbs()).includes('transcript 1 entries cursor=0'),
+      { timeoutMs: 8000 },
+    )
+
+    // And a live stream frame, which must not disturb the folded conversation.
+    await supervisor.notify('session/stream', {
+      sessionId: 'session-cross',
+      generation: 1,
+      frame: { type: 'chunk', revision: 2, index: 1,
+        chunk: { type: 'text-delta', index: 0, text: '正在回答' } },
+    })
+    await waitFor('the session to stay healthy', async () => {
+      const state = supervisor.snapshot()
+      return state.state === 'running' && state.consecutiveMissedHeartbeats === 0
+    }, { timeoutMs: 8000 })
+    const written = await breadcrumbs()
+    assert.ok(written.includes('transcript 1 entries'), 'the folded entry survives the stream')
+  } finally {
+    delete process.env['DSH_QUORFLOAT_RUST_MARKER']
+    delete process.env['DSH_QUORFLOAT_HOTKEY']
+    const result = await supervisor.stop()
+    assert.equal(result.exited, true)
+    assert.equal(result.escalated, false)
+    await rm(directory, { recursive: true, force: true })
+  }
+})

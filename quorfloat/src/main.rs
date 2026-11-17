@@ -1,0 +1,2058 @@
+//! Entry point: handshake first, then hand the process to the Tauri shell.
+//!
+//! The order is not cosmetic. The host's startup budget starts when the process
+//! does and it escalates on expiry, so the `hello` frame is written **before** any
+//! window, webview, font, or GPU work begins. A peer that initialised its window first
+//! would be killed mid-handshake on a slow machine, and the failure would look
+//! like a broken binary rather than a slow one.
+//!
+//! Nothing here may write to stdout. The host parses stdout as protocol frames, so
+//! diagnostics go through the shared sink's `log`, which writes to stderr —
+//! including the panic hook installed below, because a panic message on stdout
+//! would corrupt the stream on the way out.
+//!
+//! The shape of the shell, one thread per duty:
+//!
+//! - **reader** — owns stdin and answers frames. It needs no window to be visible,
+//!   which is why the host keeps receiving answers while the panel is hidden.
+//! - **dispatcher** — the only thread that touches the native window: it applies the
+//!   host's `window/visibility` commands, toggles on the hotkey, applies the host's
+//!   window configuration, runs the height coordination, reports visibility back,
+//!   and ends the process when the session does.
+//! - **clock** — asks the follow layer to keep its conversation current, once per
+//!   interval, so a hidden panel still notices the conversation started next to it.
+//! - **hotkey watcher** — blocks on the global hotkey channel and wakes the
+//!   dispatcher.
+//!
+//! The frontend (`frontend/`) is fed through one channel: after anything changes,
+//! the shell emits `quorfloat/state` with the bridge's snapshot, and the page
+//! re-renders from it. The page speaks back through the Tauri commands below,
+//! which are thin wrappers over the bridge (see `app/bridge.rs`).
+
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+
+use dsh_quorfloat::app::bridge::{self, ShellView};
+use dsh_quorfloat::app::geometry::{self, ScreenRect, WindowState};
+use dsh_quorfloat::app::height::{Height, HeightAction, SHADOW_SIDE};
+use dsh_quorfloat::app::language::{self, Language};
+use dsh_quorfloat::app::preferences::{self, Preferences};
+use dsh_quorfloat::app::session::interaction::parse_answers;
+use dsh_quorfloat::app::session::{
+    FrameSink, HotkeyReport, Identity, ImageAttachment, Session, SessionExit, WindowCommand,
+};
+use dsh_quorfloat::app::sink::{Reader, SharedSink, Wake};
+use dsh_quorfloat::app::window_settings::WindowSettings;
+use dsh_quorfloat::app::web_content;
+use dsh_quorfloat::ipc::rpc;
+use dsh_quorfloat::ipc::transport::StdioSink;
+use dsh_quorfloat::app::session::follow::PanelLifecycle;
+use dsh_quorfloat::runtime::desktop;
+use dsh_quorfloat::runtime::diag::marker::Marker;
+use dsh_quorfloat::runtime::hotkey::{self, Hotkey};
+use dsh_quorfloat::runtime::tray::{self, TrayMenu};
+use dsh_quorfloat::VERSION;
+
+/// How often the follow layer re-checks which conversation the panel is attached to.
+const CLOCK_INTERVAL_MS: u64 = 1000;
+
+/// How often the dispatcher checks whether the platform made room for a height request.
+const HEIGHT_TICK_MS: u64 = 50;
+
+/// Minimum visible drag area, in logical pixels, below which the panel counts as stranded.
+///
+/// The window's drag region is its top bar (about 40 logical pixels high). These are not that
+/// height: they are the part of it a user must still be able to click. Keeping the threshold
+/// below the real bar means a layout change does not silently disable the guard, while a panel
+/// with only a sliver of its top edge on screen is still brought back.
+const MIN_DRAG_WIDTH_LOGICAL: f32 = 64.0;
+const MIN_DRAG_HEIGHT_LOGICAL: f32 = 24.0;
+
+/// Height of the placeholder window until the frontend reports content heights.
+const PLACEHOLDER_HEIGHT: f64 = 400.0;
+
+/// The square native viewport that contains the official DeepSeek icon.
+const BALL_WINDOW_SIZE: f64 = 64.0;
+const BALL_RIGHT_MARGIN: f64 = 24.0;
+const BALL_BOTTOM_MARGIN: f64 = 96.0;
+
+/// Everything the Tauri commands and the worker threads share.
+struct ShellRuntime {
+    session: Arc<Mutex<Session>>,
+    sink: Arc<SharedSink>,
+    view: Arc<Mutex<ShellView>>,
+    hotkey: Mutex<Option<Hotkey>>,
+    height_tx: Sender<Wake>,
+    pinned_path: Option<std::path::PathBuf>,
+    preferences_path: Option<std::path::PathBuf>,
+    /// The live menu bar, once the platform gave us one.
+    ///
+    /// Shared with the dispatcher because the language can change from two directions — a
+    /// settings-page write on this thread, a host configuration push on the dispatcher's —
+    /// and both must re-label the same items.
+    tray: Arc<Mutex<Option<TrayMenu<tauri::Wry>>>>,
+    /// Where lifecycle breadcrumbs are written; the tray and language lines go here.
+    marker: Marker,
+    /// Whether the webview has already reported the languages it can see.
+    ///
+    /// Its one report is answered with one marker line and, at most, one seed; a page
+    /// reload re-reports, and a second line would only be noise. An atomic rather than a
+    /// lock because it is a single latch, and the report is a Tauri command that can run
+    /// while the dispatcher holds the view.
+    languages_reported: AtomicBool,
+    emit: Arc<dyn Fn() + Send + Sync>,
+}
+
+fn main() -> ExitCode {
+    install_panic_hook();
+    match run() {
+        Ok(exit) => match exit {
+            SessionExit::ShutdownRequested | SessionExit::PeerClosed => ExitCode::SUCCESS,
+        },
+        Err(message) => {
+            eprintln!("dsh-quorfloat: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Send panic output to stderr so it can never reach the protocol stream.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("dsh-quorfloat panicked: {info}");
+    }));
+}
+
+/// Persist the panel's preferences, keeping a failed save out of the command's result.
+///
+/// The in-memory value has already been applied. Failing to write it is worth a marker line,
+/// not a failed settings command: the panel must stay usable on a read-only or full disk.
+fn save_preferences(preferences: &Preferences, path: Option<&std::path::Path>, marker: &Marker) {
+    let Some(path) = path else { return };
+    if let Err(error) = preferences.save(path) {
+        marker.write(&format!("preferences save failed: {error}"));
+    }
+}
+
+/// Report a window-position save failure at most once per failure episode.
+fn report_window_save_error(state: &mut WindowState, marker: &Marker) {
+    if let Some(error) = state.take_save_error() {
+        marker.write(&format!("window position save failed: {error}"));
+    }
+}
+
+/// Run one session to completion.
+///
+/// @returns why the session ended, or a message describing a startup failure.
+fn run() -> Result<SessionExit, String> {
+    let settings = WindowSettings::from_env();
+    // Read before the window exists: the shell restores the position from this, and
+    // the same value is what it writes back at the end of the session.
+    let window_state = Arc::new(Mutex::new(WindowState::load()));
+    let pinned_path = dsh_quorfloat::app::pinned::path_from_env();
+    let preferences_path = dsh_quorfloat::app::preferences::path_from_env();
+    // Registered before the window exists: a taken accelerator is a normal outcome
+    // and must be known before `hello` reports it, so the host shows the real state
+    // rather than a key that silently does nothing.
+    let hotkey = Hotkey::register(&hotkey_to_attempt());
+    let hotkey_active = hotkey.is_active();
+
+    let marker = Marker::from_env();
+    marker.write("start");
+    // The panel's own language, and the one thing about it that only happens once.
+    //
+    // The host resolved a language before this process started: the panel's explicit setting
+    // when it has one, otherwise the Harness's own locale preference. Only the first of those
+    // arrivals is a decision — `en` is also what the host answers when nobody chose anything —
+    // so the host says which it is, and a fallback is used for the first frame but not written
+    // down: the panel's own webview has not reported yet, and `navigator.languages` is what
+    // answers a launch nobody decided (see the `report_languages` command). A remembered choice
+    // wins over the baseline either way, which is what makes a change made in the panel's
+    // settings page survive the next launch.
+    let mut preferences = preferences_path.as_deref().map(Preferences::load).unwrap_or_default();
+    let (language, seeded) = preferences::seed_language(
+        preferences.language,
+        settings.language,
+        language::baseline_decided_from_env(),
+    );
+    if seeded {
+        preferences.language = Some(language);
+        save_preferences(&preferences, preferences_path.as_deref(), &marker);
+        marker.write(&format!("language seeded: {}", language.as_str()));
+    }
+    // What the file holds, on the record, before the window exists: whether that position can
+    // actually be applied is a question about the displays, which can only be asked once there is
+    // a window to ask through — the outcome is therefore written where the window is placed.
+    marker.write(&match lock(&window_state).position() {
+        Some((x, y)) => format!("window position remembered at {x:.0},{y:.0}"),
+        None => "window position not remembered".to_owned(),
+    });
+
+    let session = Arc::new(Mutex::new(Session::new(Identity {
+        quorfloat_version: VERSION.to_owned(),
+        // The host's spelling, not Rust's: it compares these against its own
+        // `process.platform` / `process.arch` (see `platform.rs`).
+        platform: dsh_quorfloat::ipc::platform::host_platform().to_owned(),
+        arch: dsh_quorfloat::ipc::platform::host_arch().to_owned(),
+        hotkey: HotkeyReport {
+            // Empty when the host asked for no hotkey at all, which is the documented escape hatch
+            // for a development profile that must not fight the desktop one for the accelerator.
+            requested: hotkey.spec().unwrap_or_default().to_owned(),
+            registered: hotkey.is_active(),
+        },
+    })));
+    // The pin file, read once: its session half is adopted by the follow layer (which
+    // validates it against the list it will receive), and its workspace half is adopted as
+    // the new-conversation default (P0). They are **two independent facts** that happen to
+    // share a file — neither is derived from the other, and a gesture on one never clears
+    // the other — see `app/pinned.rs`.
+    let pinned = pinned_path
+        .as_deref()
+        .map(dsh_quorfloat::app::pinned::Pinned::load)
+        .unwrap_or_default();
+    {
+        let mut session = lock(&session);
+        session.adopt_pinned(pinned.session.clone(), pinned.workspace.clone());
+    }
+
+    // Shared with the sink, so a breadcrumb written from inside the session (an
+    // approval arriving, an answer being applied) lands in the same file as the
+    // lifecycle lines written here. One file, one ordering, one story.
+    let sink = Arc::new(SharedSink::new(Box::new(StdioSink::new(marker.clone()))));
+
+    // The shell's own facts, beside the session: effective settings, the hotkey as
+    // the settings chip reports it, and the height coordination.
+    //
+    // The user's preferences are overlaid on the environment baseline at
+    // **startup** — the documented contract has two call sites, this one and the
+    // host-config application in the dispatcher — so the very first snapshot the
+    // frontend renders already carries the user's choices.
+    //
+    // `preferences` was read and language-seeded above, before the marker's first lines;
+    // the effective settings reuse it so the seed is visible to the very first frame.
+    let view = Arc::new(Mutex::new(ShellView {
+        settings: settings.clone().with_preferences(&preferences),
+        hotkey_requested: hotkey.spec().map(str::to_owned),
+        hotkey_held: hotkey.held_spec().map(str::to_owned),
+        hotkey_registered: hotkey.is_active(),
+        hotkey_reason: hotkey.reason().map(str::to_owned),
+        preferences,
+        visible: settings.start_visible,
+        height: Height::new(),
+        // The summon counter's lifetime. A panel reload (a webview reload, or a restart of
+        // this process) resets the count, and the frontend must not read that reset as a
+        // summon — so the count is only meaningful beside a token that changes with the
+        // process. The pid and the start instant are the facts that change when this process
+        // does, and both are already read here.
+        summon_token: format!("{}-{}", std::process::id(), rpc::now_millis()),
+        summon_count: 0,
+    }));
+    // The effective settings at startup, on the record: the ground truth the
+    // settings page's controls are rendered from, before any host frame or
+    // user click has had a chance to change them.
+    let initial_language = {
+        let view = lock(&view);
+        marker.write(&format!(
+            "settings initial: keepOpen={} hideOnBlur={} theme={} language={}",
+            view.preferences.keep_open.unwrap_or(false),
+            view.settings.hide_on_blur,
+            theme_name_for_marker(view.settings.theme),
+            view.settings.language.as_str(),
+        ));
+        view.settings.language
+    };
+
+    // The handshake, before the Tauri app exists and therefore before any window,
+    // webview, font, or GPU initialisation can delay it.
+    {
+        let mut session = lock(&session);
+        session.start(&mut Borrowed(&sink));
+    }
+    if let Some(reason) = hotkey.reason() {
+        sink.log(&format!("global hotkey unavailable ({reason}); the panel is still reachable from the host"));
+    }
+
+    let (wake_tx, wake_rx) = channel();
+    let hotkey_wake = wake_tx.clone();
+    // Set by whichever side ends the session first. The window closing and the host
+    // closing the channel are different events and the exit code depends on which
+    // happened, so it is recorded rather than inferred afterwards.
+    let outcome: Arc<Mutex<Option<SessionExit>>> = Arc::new(Mutex::new(None));
+    let shell_ready = Arc::new(AtomicBool::new(false));
+
+    // `hello` starts the host's heartbeat budget. Answer stdin immediately,
+    // before WebView2 or WKWebView initialisation can consume that budget.
+    let reader = Reader::new(
+        Arc::clone(&session),
+        Arc::clone(&sink),
+        wake_tx.clone(),
+        Arc::clone(&outcome),
+    );
+    let reader_session = Arc::clone(&session);
+    let reader_sink = Arc::clone(&sink);
+    let reader_marker = marker.clone();
+    let reader_outcome = Arc::clone(&outcome);
+    let reader_shell_ready = Arc::clone(&shell_ready);
+    std::thread::Builder::new()
+        .name("quorfloat-stdin".to_owned())
+        .spawn(move || {
+            reader.run();
+            if !reader_shell_ready.load(Ordering::Acquire) {
+                // The main thread cannot consume Wake::Exit during shell creation.
+                // The reader has already flushed the shutdown response; exit
+                // cleanly rather than waiting for a window the host no longer wants.
+                let exit = lock(&reader_outcome).clone().unwrap_or(SessionExit::PeerClosed);
+                record_end(&reader_session, &reader_sink, &reader_marker, &exit);
+                std::process::exit(0);
+            }
+        })
+        .map_err(|error| format!("could not start the stdin reader: {error}"))?;
+
+    let shell_session = Arc::clone(&session);
+    let shell_sink = Arc::clone(&sink);
+    let shell_outcome = Arc::clone(&outcome);
+    let shell_marker = marker.clone();
+    let shell_state = Arc::clone(&window_state);
+    let shell_view = Arc::clone(&view);
+    let shell_hotkey_wake = hotkey_wake.clone();
+    // Created here rather than inside `setup` because two places need it: the setup that
+    // installs the tray, and the dispatcher, which applies a pushed configuration (and so
+    // may learn about a language change) on its own thread.
+    let shell_tray: Arc<Mutex<Option<TrayMenu<tauri::Wry>>>> = Arc::new(Mutex::new(None));
+    let dispatcher_tray = Arc::clone(&shell_tray);
+
+    let app = tauri::Builder::default()
+        .setup(move |app| {
+            // A panel that floats over other applications is an accessory, not an
+            // application: it must not take the Dock slot or the activation that a
+            // document window would.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            let handle = app.handle().clone();
+            // One channel into the frontend: after anything changes, a fresh snapshot
+            // is emitted and the page re-renders from it.
+            let emit: Arc<dyn Fn() + Send + Sync> = {
+                let handle = handle.clone();
+                let session = Arc::clone(&shell_session);
+                let view = Arc::clone(&shell_view);
+                Arc::new(move || {
+                    let session = lock(&session);
+                    let view = lock(&view);
+                    let value = bridge::snapshot(&session, &view);
+                    drop(session);
+                    drop(view);
+                    // The ball is outside the main window's event ACL. Push the same settings
+                    // through its own tiny receiver instead of widening the main panel's ACL.
+                    let ball_settings = json!({
+                        "floatingBall": value["settings"]["floatingBall"],
+                        "ballLogo": value["settings"]["ballLogo"],
+                    });
+                    let ball_script = format!("window.__quorfloatBallSettings?.({ball_settings})");
+                    let _ = handle.emit("quorfloat/state", value);
+                    if let Some(ball) = handle.get_webview_window("ball") {
+                        let _ = ball.eval(ball_script);
+                    }
+                })
+            };
+
+            // The window is created here rather than by the configuration so the
+            // development hook can point the webview at a Vite dev server:
+            // `DSH_QUORFLOAT_DEV_URL` selects an external page (hot reload while
+            // the host spawns this binary), otherwise the embedded assets load.
+            let url = match std::env::var("DSH_QUORFLOAT_DEV_URL") {
+                Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<tauri::Url>() {
+                    Ok(url) => tauri::WebviewUrl::External(url),
+                    Err(error) => {
+                        shell_sink.log(&format!(
+                            "DSH_QUORFLOAT_DEV_URL is not a URL ({error}); using the embedded frontend",
+                        ));
+                        tauri::WebviewUrl::App("index.html".into())
+                    }
+                },
+                _ => tauri::WebviewUrl::App("index.html".into()),
+            };
+            let dev_url = match &url {
+                tauri::WebviewUrl::External(url) => Some(url.clone()),
+                _ => None,
+            };
+            let ball_url = match &url {
+                tauri::WebviewUrl::External(url) => url
+                    .join("ball.html")
+                    .map(tauri::WebviewUrl::External)
+                    .unwrap_or_else(|_| tauri::WebviewUrl::App("ball.html".into())),
+                _ => tauri::WebviewUrl::App("ball.html".into()),
+            };
+            let navigation_marker = shell_marker.clone();
+            let window = tauri::WebviewWindowBuilder::new(app, "main", url)
+                .on_navigation(move |url| {
+                    let allowed = web_content::allows_navigation(url, dev_url.as_ref());
+                    if !allowed {
+                        navigation_marker.write("webview navigation blocked");
+                    }
+                    allowed
+                })
+                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+                .title("quorfloat")
+                .inner_size(f64::from(settings.width), PLACEHOLDER_HEIGHT)
+                // `frontend/index.html` ships `lang="zh-CN"` because the panel's copy defaults
+                // to Chinese; the resolved language is set here, before any page script runs,
+                // so the first paint already declares the right language for font selection
+                // and assistive technology.
+                .initialization_script(language::document_language_script(initial_language))
+                .resizable(false)
+                .maximizable(false)
+                .minimizable(false)
+                .decorations(false)
+                .transparent(true)
+                .shadow(false)
+                .skip_taskbar(true)
+                .always_on_top(settings.always_on_top)
+                .visible(false)
+                .focused(false)
+                .accept_first_mouse(true)
+                .build()
+                .map_err(|error| format!("could not create the main window: {error}"))?;
+            // Where the user left it — or the anchor, if there is nothing to restore or what was
+            // remembered is on no attached display (a coordinate from a monitor that has since
+            // been unplugged, which is exactly how a panel ends up created where nobody can see
+            // it and the hotkey looks broken). Both facts are on the record either way.
+            let (placement_settings, anchor_preferred) = {
+                let view = lock(&shell_view);
+                (view.settings.clone(), view.preferences.anchor.is_some())
+            };
+            place_window(
+                &window,
+                &placement_settings,
+                anchor_preferred,
+                &shell_state,
+                &shell_sink,
+                &shell_marker,
+            );
+            // A saved position can be on-screen yet leave only a sliver of the drag bar visible.
+            // The startup rule above checks the remembered corner; this checks whether the panel
+            // can actually be grabbed before it is ever shown.
+            ensure_window_usable(&window, &settings, &shell_sink, &shell_marker);
+
+            let ball_visible = lock(&shell_view).settings.floating_ball;
+            create_ball(&handle, ball_url, ball_visible)
+                .map_err(|error| format!("could not create the floating ball: {error}"))?;
+            shell_marker.write("floating ball created");
+
+            app.manage(ShellRuntime {
+                session: Arc::clone(&shell_session),
+                sink: Arc::clone(&shell_sink),
+                view: Arc::clone(&shell_view),
+                hotkey: Mutex::new(Some(hotkey)),
+                height_tx: wake_tx.clone(),
+                pinned_path: pinned_path.clone(),
+                preferences_path,
+                tray: Arc::clone(&shell_tray),
+                marker: shell_marker.clone(),
+                languages_reported: AtomicBool::new(false),
+                emit: emit.clone(),
+            });
+
+            // The menu bar's choices reach the dispatcher through the same queue as the hotkey
+            // and the host's commands: one thread decides what the window does.
+            let tray_wake = wake_tx.clone();
+
+            // The tray is built after the dispatcher exists (it is what answers the menu), so
+            // it needs its own handles: the dispatcher takes ownership below.
+            let tray_handle = handle.clone();
+            let tray_marker = shell_marker.clone();
+
+            spawn_dispatcher(
+                wake_rx,
+                Arc::clone(&shell_session),
+                Arc::clone(&shell_sink),
+                shell_marker,
+                handle,
+                Arc::clone(&shell_view),
+                settings.clone(),
+                settings.start_visible,
+                hotkey_active,
+                Arc::clone(&shell_state),
+                dispatcher_tray,
+                emit.clone(),
+            )
+            .map_err(|error| format!("could not start the window dispatcher: {error}"))?;
+
+            // The hotkey is watched on its own thread rather than polled: the watcher
+            // blocks until the user presses the key, then wakes the dispatcher.
+            // The menu bar icon. A failure here is reported and survived: the panel is
+            // summonable by hotkey whether or not the platform gave us a tray.
+            match tray::install(&tray_handle, tray_wake, &tray_marker, initial_language) {
+                Ok(menu) => *lock(&shell_tray) = Some(menu),
+                Err(error) => tray_marker.write(&format!("tray could not be created: {error}")),
+            }
+
+            if hotkey_active {
+                hotkey::watch_hotkey(shell_hotkey_wake, emit.clone(), Arc::clone(&shell_sink));
+            }
+
+            spawn_clock(
+                Arc::clone(&shell_session),
+                Arc::clone(&shell_sink),
+                Arc::clone(&shell_outcome),
+                emit,
+                // Where an invalidation decided in the follow layer becomes durable. The shell
+                // owns the path; the session owns the decision.
+                pinned_path.clone(),
+            )
+            .map_err(|error| format!("could not start the clock thread: {error}"))?;
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            summon_panel,
+            get_ball_settings,
+            open_main,
+            capture_screenshot,
+            open_external_url,
+            read_local_image,
+            submit,
+            cancel,
+            answer_approval,
+            answer_question,
+            select_session,
+            start_new,
+            load_earlier,
+            pin,
+            pin_workspace,
+            request_workspaces,
+            select_model,
+            set_permission,
+            dismiss_interaction,
+            dismiss_handoff,
+            log,
+            set_preferences,
+            report_content_height,
+            set_visible,
+            report_languages,
+        ])
+        .build(tauri::generate_context!())
+        .map_err(|error| format!("could not build the shell: {error}"))?;
+
+    app.run(move |_, event| {
+        // Tauri runs setup inside app.run(), before delivering Ready. Entering
+        // run is not enough: WebView creation can still occupy the main thread.
+        if matches!(event, tauri::RunEvent::Ready) {
+            shell_ready.store(true, Ordering::Release);
+        }
+    });
+    // The dispatcher exits the process with `AppHandle::exit` once the session ends;
+    // reaching here means the event loop stopped without a recorded exit.
+    let recorded = lock(&outcome).clone().unwrap_or(SessionExit::PeerClosed);
+    Ok(recorded)
+}
+
+// ── floating ball ────────────────────────────────────────────────────────────
+
+/// Create the non-activating desktop ball at a reliable primary-display position.
+fn create_ball(
+    app: &AppHandle,
+    url: tauri::WebviewUrl,
+    visible: bool,
+) -> Result<WebviewWindow, tauri::Error> {
+    let ball = tauri::WebviewWindowBuilder::new(app, "ball", url)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+        .title("DeepSeek")
+        .inner_size(BALL_WINDOW_SIZE, BALL_WINDOW_SIZE)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .skip_taskbar(true)
+        .always_on_top(true)
+        .visible(visible)
+        .focused(false)
+        .focusable(false)
+        .accept_first_mouse(true)
+        .build()?;
+    if let Ok(Some(monitor)) = ball.primary_monitor() {
+        if let Ok(size) = ball.outer_size() {
+            let area = monitor.work_area();
+            let scale = monitor.scale_factor();
+            let right = (BALL_RIGHT_MARGIN * scale).round() as i32;
+            let bottom = (BALL_BOTTOM_MARGIN * scale).round() as i32;
+            let x = area.position.x + area.size.width as i32 - size.width as i32 - right;
+            let y = area.position.y + area.size.height as i32 - size.height as i32 - bottom;
+            let _ = ball.set_position(tauri::Position::Physical(
+                tauri::PhysicalPosition::new(x, y),
+            ));
+        }
+    }
+    Ok(ball)
+}
+
+// ── window placement ─────────────────────────────────────────────────────────
+
+/// Put the panel where [`geometry::placement`] decided, and say which rule placed it.
+///
+/// One marker line per outcome, because "the panel came back somewhere odd" and "the hotkey did
+/// nothing visible" are both questions about this moment: the refusal line is the only place the
+/// dropped coordinate exists once the file has been rewritten.
+///
+/// @param window - the panel's window, just created and still hidden.
+/// @param settings - the effective settings; `anchor` is the fallback placement.
+/// @param state - the remembered geometry, read here because the decision needs it.
+/// @param sink - for a platform error that is worth a log line.
+/// @param marker - the record of what happened.
+fn place_window(
+    window: &WebviewWindow,
+    settings: &WindowSettings,
+    anchor_preferred: bool,
+    state: &Arc<Mutex<WindowState>>,
+    sink: &SharedSink,
+    marker: &Marker,
+) {
+    let displays = displays_now(window);
+    let primary = primary_display(window);
+    // The window's own physical size, taken from the window rather than from the configured
+    // width: the configuration is in logical pixels and the displays are in physical ones, and
+    // on a scaled display those differ by exactly the factor that would put the centre off.
+    let size = window.outer_size().map_or_else(
+        |_| {
+            // Unreachable in practice (the window was created a moment ago on this thread), but
+            // the fallback is scaled rather than assumed to be 1:1 for the same reason.
+            let scale = window.scale_factor().unwrap_or(1.0) as f32;
+            (settings.width * scale, PLACEHOLDER_HEIGHT as f32 * scale)
+        },
+        |size| (size.width as f32, size.height as f32),
+    );
+    // An explicit placement preference is a new user decision, not a fallback: it replaces
+    // the coordinate remembered from an earlier run. Without a preference, restore as before.
+    let remembered = if anchor_preferred { None } else { lock(state).position() };
+    let placement = geometry::placement(remembered, &displays, primary, size, settings.anchor);
+    if let Some((x, y)) = placement.position() {
+        if let Err(error) = window.set_position(tauri::Position::Physical(
+            tauri::PhysicalPosition::new(x as i32, y as i32),
+        )) {
+            sink.log(&format!("could not place the window: {error}"));
+        }
+    }
+    if let Some(note) = placement.note(settings.anchor) {
+        marker.write(&note);
+    }
+}
+
+/// The displays the platform reports, as the plain rectangles the geometry rules take.
+///
+/// Translation only — no decision happens here. A query that fails becomes an empty list, which
+/// the rules read as "nothing can be verified" (see [`geometry::placement`]); that is the safe
+/// reading of a platform that will not answer.
+///
+/// @param window - any window of this application, used as the handle to the platform.
+/// @returns every display's frame, in physical pixels.
+fn displays_now(window: &WebviewWindow) -> Vec<ScreenRect> {
+    window
+        .available_monitors()
+        .map(|monitors| {
+            monitors
+                .iter()
+                .map(|monitor| {
+                    ScreenRect::new(
+                        monitor.position().x as f32,
+                        monitor.position().y as f32,
+                        monitor.size().width as f32,
+                        monitor.size().height as f32,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The usable work areas the platform reports, in physical pixels.
+///
+/// Unlike [`displays_now`], these exclude the macOS menu bar and Dock and the Windows taskbar.
+/// That is exactly the rectangle a click can reach, so the drag-area guard uses these rather
+/// than the full frames: a panel tucked under the Dock is still inside the frame but its top bar
+/// is not clickable.
+///
+/// @param window - any window of this application, used as the handle to the platform.
+/// @returns every display's work area, or an empty list when the platform cannot answer.
+fn work_areas_now(window: &WebviewWindow) -> Vec<ScreenRect> {
+    window
+        .available_monitors()
+        .map(|monitors| {
+            monitors
+                .iter()
+                .map(|monitor| {
+                    let area = monitor.work_area();
+                    ScreenRect::new(
+                        area.position.x as f32,
+                        area.position.y as f32,
+                        area.size.width as f32,
+                        area.size.height as f32,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The primary display's usable rectangle, which is what the anchor is measured against.
+///
+/// The **work area** rather than the frame: its top edge is below the macOS menu bar and the
+/// Windows taskbar, so that is the real top of the screen for a window — and therefore the real
+/// centre too.
+///
+/// @param window - any window of this application.
+/// @returns the primary display's work area, or `None` when the platform names no primary
+///   display (the anchor then has nowhere to point and the platform's own placement stands).
+fn primary_display(window: &WebviewWindow) -> Option<ScreenRect> {
+    window.primary_monitor().ok().flatten().map(|monitor| {
+        let area = monitor.work_area();
+        ScreenRect::new(
+            area.position.x as f32,
+            area.position.y as f32,
+            area.size.width as f32,
+            area.size.height as f32,
+        )
+    })
+}
+
+/// The window's whole rectangle, in the same physical coordinates as the displays.
+///
+/// `outer_position`/`outer_size` are both physical pixels, so no scale-factor conversion belongs
+/// here: mixing logical and physical coordinates is how a window that is clearly on screen gets
+/// moved. A failed query is `None` rather than a guessed rectangle; the caller must then leave
+/// the window alone.
+///
+/// @param window - the panel's window.
+/// @returns the window rectangle, or `None` when the platform cannot answer.
+fn window_rect(window: &WebviewWindow) -> Option<ScreenRect> {
+    let position = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    Some(ScreenRect::new(
+        position.x as f32,
+        position.y as f32,
+        size.width as f32,
+        size.height as f32,
+    ))
+}
+
+/// The top strip of the window that carries the native drag gesture.
+///
+/// The frontend's top bar is about 40 logical pixels high; the guard only requires the lower
+/// `MIN_DRAG_HEIGHT_LOGICAL` part of that strip to be visible. Using a minimum rather than the
+/// exact measured bar height keeps this decision stable across font and layout changes while
+/// still refusing a barely-visible sliver.
+///
+/// @param rect - the whole window rectangle.
+/// @param scale - the window's scale factor.
+/// @returns the drag strip, no taller than the window itself.
+fn drag_strip(rect: ScreenRect, scale: f32) -> ScreenRect {
+    let height = (MIN_DRAG_HEIGHT_LOGICAL * scale).min(rect.height);
+    ScreenRect::new(rect.x, rect.y, rect.width, height)
+}
+
+/// The window's scale factor, or `1` when the platform cannot answer.
+fn window_scale(window: &WebviewWindow) -> f32 {
+    window
+        .scale_factor()
+        .ok()
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .map_or(1.0, |scale| scale as f32)
+}
+
+/// Whether enough of the window's drag area is visible to grab the panel.
+///
+/// This is deliberately stricter than "some pixel is visible": a window stranded at a corner can
+/// still intersect a display by a few pixels while its top bar is effectively unreachable. A
+/// platform that cannot report the window or its displays is treated as usable, so a failed query
+/// never moves a panel the user can see.
+///
+/// @param window - the panel's window.
+/// @returns whether the drag strip is reachable, or visibility cannot be determined.
+fn window_drag_usable(window: &WebviewWindow) -> bool {
+    let Some(rect) = window_rect(window) else { return true };
+    let areas = work_areas_now(window);
+    if areas.is_empty() {
+        return true;
+    }
+    let scale = window_scale(window);
+    let strip = drag_strip(rect, scale);
+    geometry::visible_at_least(
+        strip,
+        &areas,
+        MIN_DRAG_WIDTH_LOGICAL * scale,
+        MIN_DRAG_HEIGHT_LOGICAL * scale,
+    )
+}
+
+/// The outcome of asking the window to move back to its configured anchor.
+enum AnchorMove {
+    /// The window moved from its old top-left corner to the anchor.
+    Moved {
+        from: (f32, f32),
+        to: (f32, f32),
+    },
+    /// The window has no readable geometry; nothing can be calculated.
+    NoWindow,
+    /// The platform reported no primary display, so there is nowhere to anchor.
+    NoPrimary {
+        from: (f32, f32),
+    },
+    /// The platform refused the position write; the sink already has the error.
+    Failed,
+}
+
+/// Move a window unconditionally to the primary work area's configured anchor.
+///
+/// Shared by the unreachable-drag-area guard and the tray's explicit reset action, so both use
+/// the same primary-display, work-area, size and anchor definition. The caller decides whether
+/// to move at all; this helper does not inspect the drag strip.
+///
+/// @param window - the panel's window.
+/// @param settings - the effective settings; `anchor` is the target placement.
+/// @param sink - for a platform error that is worth a log line.
+/// @returns what happened, including the old and new positions when moved.
+fn move_window_to_anchor(
+    window: &WebviewWindow,
+    settings: &WindowSettings,
+    sink: &SharedSink,
+) -> AnchorMove {
+    let Some(rect) = window_rect(window) else { return AnchorMove::NoWindow };
+    let Some(primary) = primary_display(window) else {
+        return AnchorMove::NoPrimary { from: (rect.x, rect.y) };
+    };
+    let (x, y) = geometry::anchored(primary, (rect.width, rect.height), settings.anchor);
+    if let Err(error) = window.set_position(tauri::Position::Physical(
+        tauri::PhysicalPosition::new(x as i32, y as i32),
+    )) {
+        sink.log(&format!("could not move the window to its anchor: {error}"));
+        return AnchorMove::Failed;
+    }
+    AnchorMove::Moved { from: (rect.x, rect.y), to: (x, y) }
+}
+
+/// Bring a window whose drag area is unreachable back to the primary display's anchor.
+///
+/// This is the show-time half of the hot-plug protection, extended to the everyday case of a
+/// window dragged into a corner until only a sliver remains visible. The window is moved only
+/// when its drag strip is too small to grab; a partially visible panel whose handle is still
+/// usable is deliberately left where the user put it. The decision uses the same primary work
+/// area and anchor as startup placement, so the recovery position has one definition.
+///
+/// @param window - the panel's window, typically still hidden.
+/// @param settings - the effective settings; `anchor` is the recovery placement.
+/// @param sink - for a platform error that is worth a log line.
+/// @param marker - the record of what happened.
+/// @returns whether the window was moved.
+fn ensure_window_usable(
+    window: &WebviewWindow,
+    settings: &WindowSettings,
+    sink: &SharedSink,
+    marker: &Marker,
+) -> bool {
+    let Some(rect) = window_rect(window) else { return false };
+    let areas = work_areas_now(window);
+    if areas.is_empty() {
+        return false;
+    }
+    let scale = window_scale(window);
+    let strip = drag_strip(rect, scale);
+    if geometry::visible_at_least(
+        strip,
+        &areas,
+        MIN_DRAG_WIDTH_LOGICAL * scale,
+        MIN_DRAG_HEIGHT_LOGICAL * scale,
+    ) {
+        return false;
+    }
+    match move_window_to_anchor(window, settings, sink) {
+        AnchorMove::Moved { from: (x, y), to: (nx, ny) } => {
+            marker.write(&format!(
+                "window position rejected: drag area at {x:.0},{y:.0} is unreachable; moved to {nx:.0},{ny:.0} ({})",
+                settings.anchor.name(),
+            ));
+            true
+        }
+        AnchorMove::NoPrimary { from: (x, y) } => {
+            marker.write(&format!(
+                "window position rejected: drag area at {x:.0},{y:.0} is unreachable; no display to anchor on",
+            ));
+            false
+        }
+        AnchorMove::NoWindow | AnchorMove::Failed => false,
+    }
+}
+
+/// Move the panel to its configured anchor from the tray menu.
+///
+/// This does not show, hide or focus the window: it is a position repair for a panel the user
+/// may be looking at, and a hidden panel must stay hidden. The caller only needs the marker.
+///
+/// @param window - the panel's window.
+/// @param settings - the effective settings; `anchor` is the target placement.
+/// @param sink - for a platform error that is worth a log line.
+/// @param marker - the record of what happened.
+fn reset_window_position(
+    window: &WebviewWindow,
+    settings: &WindowSettings,
+    sink: &SharedSink,
+    marker: &Marker,
+) {
+    match move_window_to_anchor(window, settings, sink) {
+        AnchorMove::Moved { to: (x, y), .. } => {
+            marker.write(&format!(
+                "tray menu: window position reset to {x:.0},{y:.0} ({})",
+                settings.anchor.name(),
+            ));
+        }
+        AnchorMove::NoPrimary { .. } => {
+            marker.write("tray menu: window position reset failed: no display to anchor on");
+        }
+        AnchorMove::NoWindow => {
+            marker.write("tray menu: window position reset failed: window geometry unavailable");
+        }
+        AnchorMove::Failed => {}
+    }
+}
+
+// ── Tauri commands ───────────────────────────────────────────────────────────
+
+/// Run one bridge command against the session, then refresh the frontend.
+///
+/// The lock order is session, then sink, then view — everywhere in this file — so
+/// two threads cannot hold them in opposite orders and deadlock.
+fn with_session(
+    state: &ShellRuntime,
+    operation: impl FnOnce(&mut Session, &mut dyn FrameSink) -> Value,
+) -> Value {
+    let mut session = lock(&state.session);
+    let result = state.sink.with(|sink| operation(&mut session, sink));
+    drop(session);
+    (state.emit)();
+    result
+}
+
+/// Read the same effective ball settings that the state snapshots carry.
+#[tauri::command]
+fn get_ball_settings(state: tauri::State<'_, ShellRuntime>) -> Value {
+    let view = lock(&state.view);
+    json!({
+        "floatingBall": view.settings.floating_ball,
+        "ballLogo": view.settings.ball_logo,
+    })
+}
+
+/// Apply a ball visibility change without stealing focus or creating another visibility owner.
+fn apply_ball_visibility(handle: &AppHandle, visible: bool, marker: &Marker) {
+    let Some(ball) = handle.get_webview_window("ball") else {
+        return;
+    };
+    if matches!(ball.is_visible(), Ok(current) if current == visible) {
+        return;
+    }
+    let result = if visible { ball.show() } else { ball.hide() };
+    if let Err(error) = result {
+        marker.write(&format!("could not apply floatingBall={visible}: {error}"));
+        return;
+    }
+    marker.write(&format!("floating ball visibility: {visible}"));
+}
+
+/// Ask the existing dispatcher to toggle the conversation panel, exactly like the hotkey.
+#[tauri::command]
+fn summon_panel(state: tauri::State<'_, ShellRuntime>) -> Value {
+    state.marker.write("floating ball: summon requested");
+    let _ = state.height_tx.send(Wake::Hotkey);
+    json!({})
+}
+
+/// Navigate the official Harness to the requested conversation, then activate its window.
+#[tauri::command]
+async fn open_main(
+    state: tauri::State<'_, ShellRuntime>,
+    session_id: Option<String>,
+    workspace_id: Option<String>,
+) -> Result<Value, String> {
+    {
+        let mut session = lock(&state.session);
+        let requested = state.sink.with(|sink| {
+            session.open_main(session_id.as_deref(), workspace_id.as_deref(), sink)
+        });
+        if !requested {
+            return Err("could not request main-window navigation".to_owned());
+        }
+    }
+    tauri::async_runtime::spawn_blocking(desktop::open_main)
+        .await
+        .map_err(|error| format!("the Harness activation task failed: {error}"))??;
+    Ok(json!({}))
+}
+
+/// Capture the full screen into the current or default workspace.
+#[tauri::command]
+async fn capture_screenshot(state: tauri::State<'_, ShellRuntime>) -> Result<Value, String> {
+    let snapshot = {
+        let session = lock(&state.session);
+        let view = lock(&state.view);
+        bridge::snapshot(&session, &view)
+    };
+    let override_dir = std::env::var_os("DSH_QUORFLOAT_SCREENSHOT_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    let path = tauri::async_runtime::spawn_blocking(move || {
+        desktop::capture_screenshot(&snapshot, override_dir)
+    })
+    .await
+    .map_err(|error| format!("the screenshot task failed: {error}"))??;
+    Ok(json!({ "path": path }))
+}
+
+/// `submit` — send the user's text to the followed conversation.
+#[tauri::command]
+fn submit(
+    state: tauri::State<'_, ShellRuntime>,
+    text: String,
+    workspace_id: Option<String>,
+    image: Option<ImageAttachment>,
+) -> Value {
+    with_session(&state, |session, sink| {
+        bridge::submit(session, sink, &text, workspace_id.as_deref(), image)
+    })
+}
+
+/// Open a validated web address without navigating the conversation WebView.
+#[tauri::command]
+fn open_external_url(state: tauri::State<'_, ShellRuntime>, url: String) -> Result<(), String> {
+    let url = web_content::external_url(&url)?;
+    tauri_plugin_opener::open_url(url.as_str(), None::<&str>).map_err(|error| {
+        state.marker.write("external URL could not be opened");
+        format!("could not open the system browser: {error}")
+    })
+}
+
+/// Relay a bounded image chunk asynchronously; never hold session locks while waiting.
+#[tauri::command]
+async fn read_local_image(
+    state: tauri::State<'_, ShellRuntime>, session_id: String, path: String,
+    token: Option<String>, offset: Option<u64>, release: Option<bool>,
+) -> Result<Value, Value> {
+    let params = serde_json::json!({ "sessionId": session_id, "path": path,
+        "token": token, "offset": offset.unwrap_or(0), "release": release.unwrap_or(false) });
+    let (id, receiver) = {
+        let mut session = lock(&state.session);
+        state.sink.with(|sink| session.request_image(params, sink))?
+    };
+    let session = Arc::clone(&state.session);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        receiver.recv_timeout(std::time::Duration::from_secs(12))
+            .unwrap_or_else(|_| Err(serde_json::json!({ "reason": "readFailed" })))
+    }).await.unwrap_or_else(|_| Err(serde_json::json!({ "reason": "readFailed" })));
+    lock(&session).forget_image_request(id);
+    result
+}
+
+/// `cancel` — stop the turn being generated.
+#[tauri::command]
+fn cancel(state: tauri::State<'_, ShellRuntime>) -> Value {
+    with_session(&state, |session, sink| bridge::cancel(session, sink))
+}
+
+/// `answer_approval` — settle one approval card.
+#[tauri::command]
+fn answer_approval(
+    state: tauri::State<'_, ShellRuntime>,
+    interaction_id: String,
+    allow: bool,
+) -> Value {
+    with_session(&state, |session, sink| {
+        bridge::answer_approval(session, sink, &interaction_id, allow)
+    })
+}
+
+/// `answer_question` — settle one question card with the user's choices.
+///
+/// `answers` arrives as the frontend's array of `{ id, selected, custom? }`; it is
+/// parsed with the same total parser the session validates against, so an unreadable
+/// entry is refused by name rather than dropped silently.
+#[tauri::command]
+fn answer_question(
+    state: tauri::State<'_, ShellRuntime>,
+    interaction_id: String,
+    answers: Value,
+) -> Value {
+    let answers = parse_answers(Some(&answers));
+    with_session(&state, |session, sink| {
+        bridge::answer_question(session, sink, &interaction_id, answers)
+    })
+}
+
+/// `select_session` — follow a different conversation.
+#[tauri::command]
+fn select_session(state: tauri::State<'_, ShellRuntime>, session_id: String) -> Value {
+    with_session(&state, |session, sink| bridge::select_session(session, sink, &session_id))
+}
+
+/// `load_earlier` — ask the host for one older page of the conversation on screen.
+///
+/// The page itself does not come back here: it arrives as the next snapshot, so the panel
+/// keeps rendering what the host said rather than merging a page of its own.
+#[tauri::command]
+fn load_earlier(state: tauri::State<'_, ShellRuntime>) -> Value {
+    with_session(&state, |session, sink| bridge::load_earlier(session, sink))
+}
+
+/// `start_new` — go back to "new conversation" mode.
+///
+/// The pin file is written by the bridge: this gesture lets go of the session pin, and a pin the
+/// user dropped must not be back on the next run. The workspace half is untouched.
+#[tauri::command]
+fn start_new(state: tauri::State<'_, ShellRuntime>) -> Value {
+    let pinned_path = state.pinned_path.clone();
+    let mut session = lock(&state.session);
+    let result = state.sink.with(|sink| bridge::start_new(&mut session, sink, pinned_path.as_deref()));
+    drop(session);
+    (state.emit)();
+    result
+}
+
+/// `pin` — pin one conversation (or stop pinning), remembered across runs.
+///
+/// The bridge writes the file and the snapshot reads the pins back from the session, so there
+/// is nothing for the shell to patch in between: both halves are one state, emitted once.
+#[tauri::command]
+fn pin(state: tauri::State<'_, ShellRuntime>, session_id: Option<String>) -> Value {
+    let pinned_path = state.pinned_path.clone();
+    let mut session = lock(&state.session);
+    let result = state.sink.with(|sink| {
+        bridge::pin(&mut session, sink, session_id.as_deref(), pinned_path.as_deref())
+    });
+    drop(session);
+    (state.emit)();
+    result
+}
+
+/// `pin_workspace` — pin the default directory for a new conversation.
+///
+/// The workspace half only, and it leaves the conversation on screen alone: the two pins are
+/// independent facts (see `app/pinned.rs`).
+#[tauri::command]
+fn pin_workspace(state: tauri::State<'_, ShellRuntime>, workspace_id: Option<String>) -> Value {
+    let pinned_path = state.pinned_path.clone();
+    let mut session = lock(&state.session);
+    let result = state.sink.with(|sink| {
+        bridge::pin_workspace(&mut session, sink, workspace_id.as_deref(), pinned_path.as_deref())
+    });
+    drop(session);
+    (state.emit)();
+    result
+}
+
+/// `request_workspaces` — ask the host for the workspace list.
+#[tauri::command]
+fn request_workspaces(state: tauri::State<'_, ShellRuntime>) -> Value {
+    with_session(&state, |session, sink| bridge::request_workspaces(session, sink))
+}
+
+/// `select_model` — apply one model and reasoning effort.
+#[tauri::command]
+fn select_model(
+    state: tauri::State<'_, ShellRuntime>,
+    provider: String,
+    model: String,
+    effort: Option<String>,
+) -> Value {
+    with_session(&state, |session, sink| {
+        bridge::select_model(session, sink, &provider, &model, effort.as_deref())
+    })
+}
+
+/// `set_permission` — apply one permission preset.
+#[tauri::command]
+fn set_permission(state: tauri::State<'_, ShellRuntime>, value: String) -> Value {
+    with_session(&state, |session, sink| bridge::set_permission(session, sink, &value))
+}
+
+/// `dismiss_interaction` — drop one card locally.
+#[tauri::command]
+fn dismiss_interaction(state: tauri::State<'_, ShellRuntime>, interaction_id: String) -> Value {
+    with_session(&state, |session, _| bridge::dismiss_interaction(session, &interaction_id))
+}
+
+/// `dismiss_handoff` — clear the "go to the Harness window" notice.
+#[tauri::command]
+fn dismiss_handoff(state: tauri::State<'_, ShellRuntime>) -> Value {
+    with_session(&state, |session, _| bridge::dismiss_handoff(session))
+}
+
+/// `log` — put one frontend breadcrumb on the record.
+#[tauri::command]
+fn log(state: tauri::State<'_, ShellRuntime>, line: String) -> Value {
+    state.sink.with(|sink| bridge::log(sink, &line))
+}
+
+/// `set_preferences` — apply what the settings page changed.
+///
+/// The hotkey is rebound here, on the main thread, which is where the platform
+/// wants registration. A refused accelerator keeps the previous grab, exactly as
+/// `Hotkey::rebind` documents.
+///
+/// A language change also re-labels the menu bar, in place, and puts the new tag on the
+/// document element: the tray's strings and `lang` are the panel's own and follow the same
+/// setting as the page's copy.
+#[tauri::command]
+fn set_preferences(
+    state: tauri::State<'_, ShellRuntime>,
+    window: WebviewWindow,
+    theme: Option<String>,
+    keep_open: Option<bool>,
+    hotkey: Option<String>,
+    language: Option<String>,
+    anchor: Option<String>,
+    floating_ball: Option<bool>,
+    ball_logo: Option<String>,
+) -> Result<Value, String> {
+    let incoming = json!({
+        "theme": theme,
+        "keepOpen": keep_open,
+        "hotkey": hotkey,
+        "language": language,
+        "anchor": anchor,
+        "floatingBall": floating_ball,
+        "ballLogo": ball_logo,
+    });
+    let mut preferences = state
+        .preferences_path
+        .as_deref()
+        .map(Preferences::load)
+        .unwrap_or_default();
+    preferences = bridge::apply_preferences(preferences, &incoming)?;
+    save_preferences(&preferences, state.preferences_path.as_deref(), &state.marker);
+    if let Some(spec) = preferences.hotkey.clone() {
+        let mut slot = lock(&state.hotkey);
+        let rebound = slot
+            .take()
+            .unwrap_or_else(|| Hotkey::register(&spec))
+            .rebind(&spec);
+        {
+            let mut view = lock(&state.view);
+            view.hotkey_requested = rebound.spec().map(str::to_owned);
+            view.hotkey_held = rebound.held_spec().map(str::to_owned);
+            view.hotkey_registered = rebound.is_active();
+            view.hotkey_reason = rebound.reason().map(str::to_owned);
+        }
+        *slot = Some(rebound);
+    }
+    {
+        // The host's configuration is the baseline; the user's choices sit on top —
+        // the same single overlay as at startup, so a preference can never be lost
+        // to a settings update.
+        let mut view = lock(&state.view);
+        let before_language = view.settings.language;
+        view.preferences = preferences;
+        view.settings = view.settings.with_preferences(&view.preferences);
+        // On the record, with the *effective* values: this is the ground truth
+        // that answers "did the switch's click reach the behaviour" without a
+        // window to look at.
+        state.sink.mark(&format!(
+            "preferences set: keepOpen={} hideOnBlur={} theme={} language={}",
+            view.preferences.keep_open.unwrap_or(false),
+            view.settings.hide_on_blur,
+            theme_name_for_marker(view.settings.theme),
+            view.settings.language.as_str(),
+        ));
+        let language = view.settings.language;
+        let floating_ball = view.settings.floating_ball;
+        drop(view);
+        let _ = state.height_tx.send(Wake::BallVisibility(floating_ball));
+        let _ = state.height_tx.send(Wake::Frames);
+        sync_tray_language(&state.tray, language, &state.marker);
+        if before_language != language {
+            set_document_language(&window, language, &state.marker);
+        }
+    }
+    (state.emit)();
+    Ok(json!({}))
+}
+
+/// Re-label the menu bar for a language, and record the change once.
+///
+/// Idempotent by construction: the tray remembers the language its items carry, so the
+/// callers (a settings-page write, and the dispatcher applying a pushed configuration) can
+/// both call it unconditionally without producing a marker for a value that did not change.
+/// A process without a tray has nothing to re-label and writes nothing.
+///
+/// @param tray - the live tray, when the platform gave us one.
+/// @param language - the effective language.
+/// @param marker - where the one line saying the language changed is written.
+fn sync_tray_language(
+    tray: &Arc<Mutex<Option<TrayMenu<tauri::Wry>>>>,
+    language: Language,
+    marker: &Marker,
+) {
+    // The claim and the platform work are deliberately separate. `TrayMenu::relabel` calls
+    // into the platform, which blocks until the main thread runs it; holding this lock across
+    // that would let the dispatcher (relabelling a pushed configuration) and the main thread
+    // (relabelling a settings-page write) wait on each other. Claiming the new language under
+    // the lock makes the check-and-set atomic, so exactly one caller relabels and writes the
+    // marker, and the platform calls happen with no lock held.
+    let claimed = {
+        let mut slot = lock(tray);
+        match slot.as_mut() {
+            Some(menu) if menu.language() != language => {
+                menu.set_language(language);
+                Some(menu.clone())
+            }
+            _ => None,
+        }
+    };
+    let Some(mut menu) = claimed else { return };
+    menu.relabel(language, marker);
+    marker.write(&format!("language changed: {}", language.as_str()));
+}
+
+/// Put the effective language on the webview's document element.
+///
+/// The initialization script covers the initial load; this covers every later change, because
+/// `lang` is read by the platform (font selection, hyphenation, assistive technology) and a
+/// panel whose copy switched to English while its document still claimed Chinese would render
+/// English text with Chinese-preferred glyphs.
+///
+/// @param window - the panel's window.
+/// @param language - the language in force.
+/// @param marker - where a refused script is recorded.
+fn set_document_language(window: &WebviewWindow, language: Language, marker: &Marker) {
+    if let Err(error) = window.eval(language::document_language_script(language)) {
+        marker.write(&format!("could not set the document language: {error}"));
+    }
+}
+
+/// The theme's wire name, for the preferences marker.
+fn theme_name_for_marker(theme: dsh_quorfloat::app::theme::Preference) -> &'static str {
+    match theme {
+        dsh_quorfloat::app::theme::Preference::System => "system",
+        dsh_quorfloat::app::theme::Preference::Light => "light",
+        dsh_quorfloat::app::theme::Preference::Dark => "dark",
+    }
+}
+
+/// `report_content_height` — the frontend measured its own height; the dispatcher
+/// coordinates the native window with it.
+#[tauri::command]
+fn report_content_height(state: tauri::State<'_, ShellRuntime>, height: f64) -> Value {
+    let _ = state.height_tx.send(Wake::Height(height as f32));
+    json!({})
+}
+
+/// `set_visible` — the frontend asks the native window to show or hide, after its
+/// own transition has run. The dispatcher stays the only thread that touches the
+/// window: this command is a request, not a direct action.
+#[tauri::command]
+fn set_visible(state: tauri::State<'_, ShellRuntime>, visible: bool) -> Value {
+    let command = if visible { WindowCommand::Show } else { WindowCommand::Hide };
+    let _ = state.height_tx.send(Wake::Visibility(command));
+    json!({})
+}
+
+/// `report_languages` — the webview reported the languages it can see.
+///
+/// This is the panel's answer to the one question the host cannot answer. With nothing
+/// chosen anywhere the Harness's own rule is "the browser decides", and the panel *is* a
+/// webview: `navigator.languages` is that decision, in the user's own order. The host
+/// process cannot speak for it — Node's POSIX locale is not the same signal, and on macOS
+/// a GUI launch usually has no `LANG` at all — which is why this arrives from the page.
+///
+/// The report matters only while nothing has been chosen. A language remembered by the
+/// panel, an explicit plugin configuration, and the Harness's stored locale all outrank
+/// it, and in those cases the startup seed already wrote the value down; this command
+/// then records the raw list and changes nothing. When it does seed, the language is
+/// persisted as the panel's own choice, so the webview is asked once per install and
+/// never followed: a later launch starts from the remembered value.
+///
+/// The rejected reports say so without a marker line: the raw list is written exactly
+/// once per launch, because a second line would make "what did the panel report" and
+/// "how many times did it say so" the same question.
+#[tauri::command]
+fn report_languages(
+    state: tauri::State<'_, ShellRuntime>,
+    window: WebviewWindow,
+    languages: Option<Vec<String>>,
+) -> Value {
+    let languages = languages.unwrap_or_default();
+    if state.languages_reported.swap(true, Ordering::SeqCst) {
+        state.sink.log("ignoring a repeated language report from the panel");
+        return json!({});
+    }
+    // Verbatim, in the order the webview reported it. The whole point of this line is to
+    // show what this machine actually says, so nothing is summarised or reordered.
+    state.marker.write(&format!(
+        "panel languages reported: {}",
+        if languages.is_empty() { "(none)".to_owned() } else { languages.join(", ") },
+    ));
+
+    let mut preferences = lock(&state.view).preferences.clone();
+    let (adopted, seeded) = preferences::seed_from_reported(preferences.language, &languages);
+    if !seeded {
+        // Nothing to adopt: the panel remembers a language, or a decided baseline was
+        // already seeded at startup. Silence rather than a second seed line.
+        return json!({});
+    }
+    preferences.language = Some(adopted);
+    save_preferences(&preferences, state.preferences_path.as_deref(), &state.marker);
+    {
+        // The same overlay as everywhere else: the webview's answer is now the panel's own
+        // choice, sitting on top of the host's baseline rather than beside it.
+        let mut view = lock(&state.view);
+        view.preferences = preferences;
+        view.settings = view.settings.with_preferences(&view.preferences);
+    }
+    state.marker.write(&format!("language seeded: {}", adopted.as_str()));
+    // The tray and the document element are the panel's own surfaces for this setting, and
+    // both follow it live — the same two calls a settings-page change makes.
+    sync_tray_language(&state.tray, adopted, &state.marker);
+    set_document_language(&window, adopted, &state.marker);
+    (state.emit)();
+    json!({})
+}
+
+// ── dispatcher ───────────────────────────────────────────────────────────────
+
+/// Applies window commands, the host's window configuration and the hotkey to the
+/// native window, runs the height coordination, reports visibility changes, and
+/// ends the process when the session does.
+///
+/// The one thread that touches the window: nothing else may show, hide, or resize
+/// it, so the reported visibility and the real one cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+fn spawn_dispatcher(
+    wake: Receiver<Wake>,
+    session: Arc<Mutex<Session>>,
+    sink: Arc<SharedSink>,
+    marker: Marker,
+    handle: AppHandle,
+    view: Arc<Mutex<ShellView>>,
+    settings: WindowSettings,
+    start_visible: bool,
+    hotkey_active: bool,
+    window_state: Arc<Mutex<WindowState>>,
+    tray: Arc<Mutex<Option<TrayMenu<tauri::Wry>>>>,
+    emit: Arc<dyn Fn() + Send + Sync>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("quorfloat-window".to_owned())
+        .spawn(move || {
+            let Some(window) = handle.get_webview_window("main") else {
+                sink.log("the main window does not exist; the panel cannot appear");
+                return;
+            };
+            // Measured capabilities: the shell is a fact of the binary, the hotkey
+            // was measured before the handshake, and the window is real by the time
+            // this thread runs. Nothing here is a claim.
+            let capabilities: Vec<&'static str> = if hotkey_active {
+                vec!["tauri", "hotkey", "window"]
+            } else {
+                vec!["tauri", "window"]
+            };
+            let mut visible = start_visible;
+            // The last anchor actually applied to the native window, independent of a newer
+            // preference in the view. A settings write therefore cannot hide its own move.
+            let mut applied_anchor = lock(&view).settings.anchor;
+            // The language the document element currently carries; `None` until the first
+            // tick applies it, because the initialization script may have run before the
+            // document existed.
+            let mut document_language: Option<Language> = None;
+            if start_visible {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            set_view_visible(&view, visible);
+            // The first report is the measurement the host waits for: until it
+            // arrives, the host does not know whether a panel can appear at all.
+            report_visibility(&session, &sink, visible, &capabilities);
+
+            loop {
+                match wake.recv_timeout(Duration::from_millis(HEIGHT_TICK_MS)) {
+                    Ok(Wake::Frames) => {
+                        let commands = {
+                            let mut session = lock(&session);
+                            session.take_window_commands()
+                        };
+                        let mut changed = false;
+                        for command in commands {
+                            changed = true;
+                            apply_window_command(&window, command, &mut visible, &settings, &sink, &marker);
+                        }
+                        if changed {
+                            set_view_visible(&view, visible);
+                            report_visibility(&session, &sink, visible, &capabilities);
+                        }
+                        // The host's `ready` may have changed the window section:
+                        // apply it, then re-apply the user's preferences on top.
+                        let language = apply_host_window(
+                            &window,
+                            &session,
+                            &view,
+                            &sink,
+                            &marker,
+                            &tray,
+                            &mut applied_anchor,
+                        );
+                        let ball_visible = lock(&view).settings.floating_ball;
+                        apply_ball_visibility(&handle, ball_visible, &marker);
+                        if document_language != Some(language) {
+                            set_document_language(&window, language, &marker);
+                            document_language = Some(language);
+                        }
+                        emit();
+                    }
+                    Ok(Wake::Tray(action)) => {
+                        use dsh_quorfloat::runtime::tray::TrayAction;
+                        match action {
+                            TrayAction::ToggleVisibility => {
+                                // The hotkey's path, for the hotkey's reason: a panel that is up
+                                // plays its own exit transition and asks to hide when it ends,
+                                // so hiding the native window here would cut the fade short.
+                                // A panel reported visible but on no display cannot be hidden by
+                                // a user who cannot see it; the same toggle brings it back.
+                                if visible && window_drag_usable(&window) {
+                                    marker.write("tray menu: hide");
+                                    let _ = handle.emit("quorfloat/hotkey-hide", ());
+                                } else {
+                                    marker.write(if visible {
+                                        "tray menu: panel drag area unavailable; showing again"
+                                    } else {
+                                        "tray menu: show"
+                                    });
+                                    apply_window_command(
+                                        &window,
+                                        WindowCommand::Show,
+                                        &mut visible,
+                                        &settings,
+                                        &sink,
+                                        &marker,
+                                    );
+                                    set_view_visible(&view, visible);
+                                    report_visibility(&session, &sink, visible, &capabilities);
+                                    emit();
+                                }
+                            }
+                            TrayAction::ResetPosition => {
+                                reset_window_position(&window, &settings, &sink, &marker);
+                            }
+                            TrayAction::Restart | TrayAction::Quit => {
+                                let stop = action == TrayAction::Quit;
+                                marker.write(if stop {
+                                    "tray menu: exit"
+                                } else {
+                                    "tray menu: restart"
+                                });
+                                let lifecycle = if stop {
+                                    PanelLifecycle::Stop
+                                } else {
+                                    PanelLifecycle::Restart
+                                };
+                                {
+                                    let mut session = lock(&session);
+                                    let _ = sink.with(|sink| {
+                                        session.request_panel_lifecycle(lifecycle, sink)
+                                    });
+                                }
+                                // The menu bar is ours, so choosing from it made *us* the active
+                                // application. Neither of these two brings a panel up, so the
+                                // keyboard goes back to whatever the user was doing (the same
+                                // rule the hide path follows, see `yield_activation`).
+                                yield_activation(&window, &marker);
+                            }
+                        }
+                    }
+                    Ok(Wake::Hotkey) => {
+                        // A visible but unreachable panel is not something the user can hide:
+                        // treat the hotkey as a rescue and let the show guard bring it back.
+                        // It is not a fresh summon, so the conversation on screen is kept.
+                        let was_visible = visible;
+                        if was_visible && window_drag_usable(&window) {
+                            // The frontend plays the exit transition and asks to
+                            // hide when it finishes: hiding the native window here
+                            // would cut the 180ms fade short. The host can still
+                            // force-hide through `window/visibility` on Frames.
+                            let _ = handle.emit("quorfloat/hotkey-hide", ());
+                        } else {
+                            if was_visible {
+                                marker.write("hotkey: panel drag area unavailable; showing again");
+                            }
+                            apply_window_command(
+                                &window,
+                                WindowCommand::Show,
+                                &mut visible,
+                                &settings,
+                                &sink,
+                                &marker,
+                            );
+                            set_view_visible(&view, visible);
+                            // A hidden-panel summon means a fresh conversation, unless the pin
+                            // says "continue this one". The off-screen rescue above keeps the
+                            // conversation, because the panel was already showing it.
+                            // The host's own shows (`window/visibility` on Frames) do not reset —
+                            // that is the host's intent, not a summon.
+                            if !was_visible {
+                                let mut session = lock(&session);
+                                // The shell's facts are locked second, the same order `emit`
+                                // takes them in: session, then view.
+                                let mut view = lock(&view);
+                                let _ = sink.with(|sink| bridge::on_show(&mut session, &mut view, sink));
+                            }
+                            report_visibility(&session, &sink, visible, &capabilities);
+                            emit();
+                        }
+                    }
+                    Ok(Wake::Height(panel_height)) => {
+                        apply_height(&window, &view, &marker, &emit, panel_height);
+                    }
+                    Ok(Wake::BallVisibility(ball_visible)) => {
+                        apply_ball_visibility(&handle, ball_visible, &marker);
+                    }
+                    Ok(Wake::Visibility(command)) => {
+                        apply_window_command(&window, command, &mut visible, &settings, &sink, &marker);
+                        set_view_visible(&view, visible);
+                        report_visibility(&session, &sink, visible, &capabilities);
+                        emit();
+                    }
+                    Ok(Wake::Exit(exit)) => {
+                        // Remember where the panel was — a drag that ends inside the
+                        // settle window is as real as any other move — then leave.
+                        let now = rpc::now_millis();
+                        if let Ok(position) = window.outer_position() {
+                            // The displays are read fresh here rather than reused from a tick:
+                            // this is the write that outlives the process, so it is judged
+                            // against the arrangement that exists at the moment of quitting.
+                            let displays = displays_now(&window);
+                            let mut state = lock(&window_state);
+                            state.observe((position.x as f32, position.y as f32), &displays, now);
+                            state.flush(&displays, now);
+                            report_window_save_error(&mut state, &marker);
+                        }
+                        record_end(&session, &sink, &marker, &exit);
+                        handle.exit(0);
+                        return;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Height housekeeping: check whether the platform made room.
+                        tick_height(&window, &view, &marker, &emit);
+                        // And where the panel is now: a drag is remembered once it
+                        // settles (the geometry module's one-second rule), so a
+                        // crash or a kill does not lose the user's placement.
+                        //
+                        // The display list is read next to the position rather than cached: a
+                        // position is only remembered while it is on a display that exists now,
+                        // and "now" is the only moment at which that can be answered. The
+                        // alternative — a cached list — would keep a hot-unplugged monitor
+                        // "attached" for as long as the cache lives, which is precisely the
+                        // coordinate this check exists to refuse. The cost is one platform query
+                        // per tick, beside the position query that was already here.
+                        if let Ok(position) = window.outer_position() {
+                            let displays = displays_now(&window);
+                            let mut state = lock(&window_state);
+                            state.observe(
+                                (position.x as f32, position.y as f32),
+                                &displays,
+                                rpc::now_millis(),
+                            );
+                            report_window_save_error(&mut state, &marker);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        sink.log("the wake channel closed; exiting");
+                        record_end(&session, &sink, &marker, &SessionExit::PeerClosed);
+                        handle.exit(0);
+                        return;
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+}
+
+/// Record the current visibility in the shell's view, for the snapshot.
+///
+/// The dispatcher is the only writer, and every window command goes through it,
+/// so the view and the window cannot disagree.
+fn set_view_visible(view: &Arc<Mutex<ShellView>>, visible: bool) {
+    lock(view).visible = visible;
+}
+
+/// Apply one parsed command to the native window.
+///
+/// @param window - the panel's window.
+/// @param command - what the host or the hotkey asked for.
+/// @param visible - the dispatcher's record of the current state.
+/// @param settings - the effective settings; `anchor` is the off-screen recovery placement.
+/// @param sink - for a platform error that is worth a log line.
+fn apply_window_command(
+    window: &WebviewWindow,
+    command: WindowCommand,
+    visible: &mut bool,
+    settings: &WindowSettings,
+    sink: &SharedSink,
+    marker: &Marker,
+) {
+    match command {
+        WindowCommand::Show => {
+            ensure_window_usable(window, settings, sink, marker);
+            resume_activation(window);
+            let _ = window.show();
+            let _ = window.set_focus();
+            *visible = true;
+        }
+        WindowCommand::Hide => {
+            let _ = window.hide();
+            yield_activation(window, marker);
+            *visible = false;
+        }
+        WindowCommand::Toggle => {
+            // A visible but unreachable panel cannot be hidden by a user who cannot grab it:
+            // treat the toggle as a rescue and show it at the anchor instead.
+            if *visible && window_drag_usable(window) {
+                let _ = window.hide();
+                yield_activation(window, marker);
+                *visible = false;
+            } else {
+                ensure_window_usable(window, settings, sink, marker);
+                resume_activation(window);
+                let _ = window.show();
+                let _ = window.set_focus();
+                *visible = true;
+            }
+        }
+    }
+}
+
+/// Put the application back in a state where its window can take the keyboard.
+///
+/// [`yield_activation`] hides the *application*, so a later `window.show()` has to lift that
+/// first — otherwise the panel would come back visible but unable to take focus.
+#[cfg(target_os = "macos")]
+fn resume_activation(window: &WebviewWindow) {
+    let _ = window.app_handle().show();
+}
+
+/// Nothing to do where the platform has no application-level hide (see below).
+#[cfg(not(target_os = "macos"))]
+fn resume_activation(_window: &WebviewWindow) {}
+
+/// Hand the keyboard back to whatever the user came from.
+///
+/// The panel is an accessory application (`set_activation_policy(Accessory)`), the way a launcher
+/// is, so summoning it deactivates whatever the user was typing in. Hiding only the *window* left
+/// that application deactivated with no window of ours to type into: close the panel and the caret
+/// is nowhere.
+/// `App::hide()` is `[NSApp hide:nil]`: it hides the application and macOS activates the
+/// application that was active before it, which is the move a launcher makes.
+///
+/// It is safe on every path: when the panel is not the active application (the click-away blur,
+/// or a hide after the user switched somewhere else) hiding an inactive application changes no
+/// activation, so nobody gets pulled back.
+fn yield_activation(window: &WebviewWindow, marker: &Marker) {
+    #[cfg(target_os = "macos")]
+    {
+        marker.write("window hide: yielding activation to the previous app");
+        let app = window.app_handle();
+        let _ = app.hide();
+        // NSApp hide also hides the independent ball. Unhide without activating so the ball
+        // remains available while the already-hidden conversation window stays hidden.
+        let _ = app.show();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, marker);
+    }
+}
+
+/// Apply the host's `config.window` to the effective settings and the native window.
+///
+/// The overlay order is the documented one: host baseline first, then the user's
+/// preferences on top (`app/bridge.rs`). Only a change reaches the platform.
+///
+/// The language is part of that push, and it is the one field that also reaches a surface
+/// this process owns rather than the webview: the menu bar is re-labelled here, because a
+/// host-side configuration change never goes through the settings-page command.
+///
+/// @returns the effective language after the overlay, so the caller can also keep the
+///   document element in step without locking the view a second time.
+fn apply_host_window(
+    window: &WebviewWindow,
+    session: &Arc<Mutex<Session>>,
+    view: &Arc<Mutex<ShellView>>,
+    sink: &SharedSink,
+    marker: &Marker,
+    tray: &Arc<Mutex<Option<TrayMenu<tauri::Wry>>>>,
+    applied_anchor: &mut dsh_quorfloat::app::geometry::Anchor,
+) -> Language {
+    let host_window = {
+        let session = lock(session);
+        session.host_config().window.clone()
+    };
+    let (changed, width, always_on_top, hide_on_blur, language, settings) = {
+        let mut view = lock(view);
+        let before = view.settings.clone();
+        view.settings.apply_host(host_window.as_ref());
+        view.settings = view.settings.with_preferences(&view.preferences);
+        (
+            view.settings != before,
+            view.settings.width,
+            view.settings.always_on_top,
+            view.settings.hide_on_blur,
+            view.settings.language,
+            view.settings.clone(),
+        )
+    };
+    // Unconditional, and idempotent: the tray itself knows the language it carries, so a
+    // tick that changed nothing writes nothing.
+    sync_tray_language(tray, language, marker);
+    if !changed && *applied_anchor == settings.anchor {
+        return language;
+    }
+    let native_width = f64::from(width + SHADOW_SIDE * 2.0);
+    if let Ok(size) = window.inner_size() {
+        if let Err(error) = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+            native_width,
+            size.height as f64,
+        ))) {
+            marker.write(&format!("could not apply the host's width: {error}"));
+        }
+    }
+    if let Err(error) = window.set_always_on_top(always_on_top) {
+        marker.write(&format!("could not apply the host's alwaysOnTop: {error}"));
+    }
+    marker.write(&format!(
+        "window config applied: width={width:.0} alwaysOnTop={always_on_top} hideOnBlur={hide_on_blur}",
+    ));
+    if *applied_anchor != settings.anchor {
+        match move_window_to_anchor(window, &settings, sink) {
+            AnchorMove::Moved { to: (x, y), .. } => {
+                *applied_anchor = settings.anchor;
+                marker.write(&format!(
+                    "window anchor applied: {x:.0},{y:.0} ({})",
+                    settings.anchor.name(),
+                ));
+            }
+            AnchorMove::NoPrimary { .. } => {
+                marker.write("window anchor could not be applied: no primary display");
+            }
+            AnchorMove::NoWindow => {
+                marker.write("window anchor could not be applied: window geometry unavailable");
+            }
+            AnchorMove::Failed => {}
+        }
+    }
+    language
+}
+
+/// Accept the frontend's measured panel height and coordinate the native window.
+fn apply_height(
+    window: &WebviewWindow,
+    view: &Arc<Mutex<ShellView>>,
+    marker: &Marker,
+    emit: &Arc<dyn Fn() + Send + Sync>,
+    panel_height: f32,
+) {
+    let action = {
+        let mut view = lock(view);
+        view.height.retarget(panel_height, rpc::now_millis())
+    };
+    if let Some(HeightAction::Resize { native }) = action {
+        resize(window, view, marker, native);
+        emit();
+    }
+}
+
+/// The periodic height check: did the platform make room for the outstanding request?
+fn tick_height(
+    window: &WebviewWindow,
+    view: &Arc<Mutex<ShellView>>,
+    marker: &Marker,
+    emit: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let action = {
+        let native = window
+            .inner_size()
+            .map(|size| size.height as f32)
+            .unwrap_or(0.0);
+        let mut view = lock(view);
+        view.height.tick(rpc::now_millis(), native)
+    };
+    match action {
+        Some(HeightAction::Resize { native }) => {
+            resize(window, view, marker, native);
+            emit();
+        }
+        Some(HeightAction::Cap { available_panel }) => {
+            let (target, _) = {
+                let view = lock(view);
+                (view.height.target(), view.settings.width)
+            };
+            marker.write(&format!(
+                "height capped at {available_panel:.0}: asked {target:.0}, the window never made room",
+            ));
+            emit();
+        }
+        None => {}
+    }
+}
+
+/// Ask the platform for one native inner size, on the record.
+fn resize(
+    window: &WebviewWindow,
+    view: &Arc<Mutex<ShellView>>,
+    marker: &Marker,
+    native: f32,
+) {
+    let width = {
+        let view = lock(view);
+        f64::from(view.settings.width + SHADOW_SIDE * 2.0)
+    };
+    if let Err(error) =
+        window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(width, f64::from(native))))
+    {
+        marker.write(&format!("could not set the window size: {error}"));
+        return;
+    }
+    let panel = {
+        let view = lock(view);
+        view.height.target()
+    };
+    marker.write(&format!("layout panel={panel:.0} window={width:.0}x{native:.0}"));
+}
+
+/// Wake the follow layer once per interval.
+///
+/// @param session - the session to pump.
+/// @param sink - where the follow requests go.
+/// @param outcome - set when the session ends; the thread stops seeing it.
+/// @param nudge - how to tell the frontend the state changed.
+/// @param pinned_path - where a pin the follow layer invalidated is written down.
+fn spawn_clock(
+    session: Arc<Mutex<Session>>,
+    sink: Arc<SharedSink>,
+    outcome: Arc<Mutex<Option<SessionExit>>>,
+    nudge: Arc<dyn Fn() + Send + Sync>,
+    pinned_path: Option<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("quorfloat-clock".to_owned())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(CLOCK_INTERVAL_MS));
+            if lock(&outcome).is_some() {
+                return;
+            }
+            let wrote_pin = {
+                let mut session = lock(&session);
+                sink.with(|sink| {
+                    session.pump_follow(sink);
+                    // A pin the follow layer forgot (an absent conversation, a gone workspace, a
+                    // definitive refusal) has to stop being remembered across runs, and only this
+                    // side knows where the file is. Written here so the decision and the record
+                    // are the same tick.
+                    bridge::persist_pins(&mut session, pinned_path.as_deref(), sink)
+                })
+            };
+            if wrote_pin {
+                // The panel's status line explains the loss; without this nudge it would keep
+                // drawing the old pin until the next clock tick happened to change something.
+                nudge();
+            }
+        })
+        .map(|_| ())
+}
+
+/// Report the panel's measured visibility and capabilities to the host.
+fn report_visibility(
+    session: &Arc<Mutex<Session>>,
+    sink: &Arc<SharedSink>,
+    visible: bool,
+    capabilities: &[&str],
+) {
+    let session = lock(session);
+    session.report_visibility(visible, capabilities, &mut Borrowed(sink));
+}
+
+/// The facts written when the session finishes: why it ended, and whether the handshake
+/// completed. Written by the dispatcher before it exits the process, because
+/// `AppHandle::exit` does not come back.
+fn record_end(
+    session: &Arc<Mutex<Session>>,
+    sink: &Arc<SharedSink>,
+    marker: &Marker,
+    exit: &SessionExit,
+) {
+    {
+        let session = lock(session);
+        if session.is_ready() {
+            let host = session.host_config();
+            marker.write(&format!(
+                "ready host={} session={}",
+                host.host_version.as_deref().unwrap_or("unknown"),
+                host.session_id.as_deref().unwrap_or("unknown"),
+            ));
+        } else {
+            marker.write("not-ready");
+        }
+    }
+    sink.log(&format!("session ended: {exit:?}"));
+    marker.write(&format!("end {exit:?}"));
+}
+
+/// The accelerator to register, from the host's spawn environment.
+fn configured_hotkey() -> String {
+    std::env::var("DSH_QUORFLOAT_HOTKEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Alt+Space".to_owned())
+}
+
+/// The accelerator this run should try to hold.
+///
+/// The rule lives in the library (`app::preferences::hotkey_to_attempt`) so it can be tested as a
+/// pure function; this only supplies the two facts it needs. Reading it here rather than inside
+/// the app is deliberate: the grab has to be taken before the window exists, so that `hello` can
+/// report what is really held instead of what was hoped for.
+///
+/// @returns the accelerator to attempt.
+fn hotkey_to_attempt() -> String {
+    let remembered = dsh_quorfloat::app::preferences::path_from_env();
+    let preferences = dsh_quorfloat::app::preferences::Preferences::load(
+        remembered.as_deref().unwrap_or(std::path::Path::new("")),
+    );
+    dsh_quorfloat::app::preferences::hotkey_to_attempt(&preferences, &configured_hotkey())
+}
+
+/// Lock a mutex, recovering from poisoning.
+///
+/// The guarded values are plain state; a panic elsewhere cannot leave them
+/// half-updated, and refusing to continue would turn one panic into a dead session.
+///
+/// @param mutex - the mutex to lock.
+/// @returns the guard.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Hands the shared sink to a `&mut dyn FrameSink` parameter.
+struct Borrowed<'a>(&'a SharedSink);
+
+impl FrameSink for Borrowed<'_> {
+    fn send(&mut self, frame: &serde_json::Value) -> std::io::Result<()> {
+        self.0.send(frame)
+    }
+
+    fn log(&mut self, line: &str) {
+        self.0.log(line);
+    }
+}

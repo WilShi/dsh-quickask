@@ -1,0 +1,69 @@
+# 操作系统
+.DS_Store
+**/.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+# Windows 的缩略图缓存与文件夹视图设置
+Thumbs.db
+Desktop.ini
+
+# 编辑器 / IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# npm run build
+/lib/
+
+# scripts/dev.mjs 的产物：暂存的分发形态与一次性的 DSH_HOME
+.dev-home/
+
+# scripts/release.mjs 的产物：各平台的发布包目录
+/bundles/
+
+# scripts/release-npm.mjs 的产物：npm 发布包，按版本分目录
+/bundles/npm/
+
+# Downloaded workflow packages used by the publish job
+/.release-artifacts/
+
+# npm run toolchain
+.tooling/
+
+# Harness - npm run contract:extract
+# DeepSeek Harness
+.tooling/conformance/
+
+# 依赖
+node_modules/
+# 本地测试插件时使用的包管理与编译缓存
+.pnpm-store/
+.npm-cache/
+.cargo-home/
+/artifacts/
+
+
+# --- 开发期运行数据 ---
+# peer-probe / mock-quorfloat
+/tmp-quorfloat-*.json
+quorfloat-probe*.json
+*-probe.json
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# local
+*.local
+*.local.*
+.dev.vars
+.env
+.env.*
+
+# TODO
+/TODO.md
+
+# Local release backups and design previews (not distributed)
+/backups/
+/design/

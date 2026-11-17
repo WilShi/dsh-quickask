@@ -1,0 +1,314 @@
+// The panel app: the shell's snapshot in, the whole tree out, and the panel's own view
+// state (which page, which popover, the draft, the folds).
+//
+// Nothing here edits the snapshot: browsing choices stay in the view, and session actions
+// leave through `api` so the host stays the authority.
+
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { api } from '../api'
+import { useDocumentPreferences } from '../hooks/useDocumentPreferences'
+import { useFlight } from '../hooks/useFlight'
+import { useGlobalKeys } from '../hooks/useGlobalKeys'
+import { useSessionScope } from '../hooks/useSessionScope'
+import { useT } from '../hooks/useI18n'
+import { useViewportHeight } from '../hooks/useViewportHeight'
+import { pinToBottom } from '../logic/bottom-pin'
+import { readImageFile } from '../logic/image'
+import { usePanelDynamics } from '../hooks/usePanelDynamics'
+import { SHADOW_ROOM, type Painted } from '../logic/panel'
+import type { Scope } from '../logic/scope'
+import type { ImageDraft, Snapshot } from '../logic/state'
+import { observeSummon, type SummonMark } from '../logic/summon'
+import { isBusy, targetWorkspace } from '../logic/view-text'
+import { ConversationPage } from './conversation/ConversationPage'
+import { Footer } from './footer/Footer'
+import { Panel } from './Panel'
+import { SettingsPage } from './settings/SettingsPage'
+import { TopBar } from './chrome/TopBar'
+
+/** Props for {@link App}. */
+export interface AppProps {
+  /** The latest snapshot from the shell. */
+  readonly state: Snapshot
+}
+
+/**
+ * Render the panel.
+ *
+ * @param props - the snapshot.
+ * @returns the panel.
+ */
+export function App({ state }: AppProps) {
+  const t = useT()
+  const panelRef = useRef<HTMLElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const imageFileRef = useRef<HTMLInputElement>(null)
+  /** The composer's draft: the DOM's while the user types, read back on send. */
+  const draft = useRef('')
+  /** The last submitted text, for the "refused → put the words back" rule. */
+  const lastSent = useRef<{ text: string; image: ImageDraft | null; restored: boolean } | null>(null)
+  const [imageDraft, setImageDraft] = useState<ImageDraft | null>(null)
+
+  const [page, setPage] = useState<'main' | 'settings'>('main')
+  const [openMenu, setOpenMenu] = useState<string | null>(null)
+  const [recording, setRecording] = useState(false)
+  const [transientError, setTransientError] = useState<string | null>(null)
+  const [folds, setFolds] = useState<ReadonlyMap<string, boolean>>(() => new Map())
+  // The workspace the user picked for this visit, if they picked one. It is never seeded from
+  // the shell's pin: `state.session.createWorkspace` already carries the ladder's answer (P0
+  // is that pin, validated), so seeding would only add a second copy that can go stale when
+  // the pin moves.
+  const [workspaceChoice, setWorkspaceChoice] = useState<string | null>(null)
+  // A browsing-only choice never becomes the workspace passed to a new conversation.
+  const [browseChoice, setBrowseChoice] = useState<{
+    readonly scope: Scope
+    readonly sessionId: string | null
+  } | null>(null)
+  const followingId = state.session.following?.sessionId ?? null
+  // The last summon counter this panel saw, with the process lifetime it belonged to. A reload
+  // or a sidecar restart changes the token, and that is *not* a summon: without the mark, the
+  // counter's reset would clear a choice the user is still making (see `logic/summon.ts`).
+  const summonMark = useRef<SummonMark | null>(null)
+
+  useDocumentPreferences(state.settings)
+
+  // A summon begins a new visit, so the workspace chosen for the last one is over. Cleared
+  // here — the only place that knows a summon happened — rather than in the shell, because the
+  // choice belongs to this page's visit and dies with it.
+  useEffect(() => {
+    const observation = observeSummon(summonMark.current, state.window.summon)
+    summonMark.current = observation.mark
+    if (observation.summoned) {
+      setWorkspaceChoice(null)
+      setBrowseChoice(null)
+    }
+  }, [state.window.summon])
+
+  useEffect(() => { setBrowseChoice(null) }, [followingId])
+
+  // The room the native window gives the panel: the product cap is a ceiling, not a
+  // promise. It is part of the markup (below) so that everything inside the panel —
+  // including the windowed thread, which measures its own viewport — lays out against the
+  // real box before any effect runs.
+  const viewport = useViewportHeight()
+  const available = Math.max(80, viewport - SHADOW_ROOM)
+  const maxHeight = Math.min(state.settings.maxHeight, available)
+
+  // What the top bar names: the user's pick, or where the shell would create the conversation.
+  const target = targetWorkspace(state, workspaceChoice)
+  // The automatic scope stays sticky while unresolved. An explicit browsing choice wins
+  // only until the conversation changes; it does not enter that automatic memory or `target`.
+  const automaticScope = useSessionScope(state, target)
+  const scope = browseChoice?.sessionId === followingId ? browseChoice.scope : automaticScope
+
+  const arrived: Painted = { page, session: state.transcript.sessionId }
+  const { remeasure } = usePanelDynamics(panelRef, state, arrived, available)
+
+  // What a summon puts on screen. The panel is a thing you call for, not a place you
+  // resume: the settings page and any open list belonged to the *last* visit, and coming
+  // back to them (or to a half-finished chord capture, which would eat the next keystroke)
+  // answers a question the user did not ask. The composer is focused so the summon ends
+  // where the user's attention is.
+  const onPanelShown = useCallback((): void => {
+    setPage('main')
+    setOpenMenu(null)
+    setRecording(false)
+    setTransientError(null)
+    inputRef.current?.focus()
+  }, [])
+  const flight = useFlight(panelRef, state, onPanelShown)
+
+  // The refusal recovery rule: the composer clears on send, and when the shell later
+  // refuses, the words come back — only into an empty input, and only when it is not the
+  // one being typed into.
+  useEffect(() => {
+    const outcome = state.delivery.prompt.state
+    const sent = lastSent.current
+    if (outcome === 'failed' && sent !== null && !sent.restored) {
+      const input = inputRef.current
+      if (draft.current === '' && (input?.value ?? '') === '') {
+        draft.current = sent.text
+        setImageDraft(sent.image)
+        sent.restored = true
+        if (input !== null && document.activeElement !== input) input.value = sent.text
+        remeasure()
+      }
+    }
+    if (outcome !== 'failed' && sent !== null && sent.restored) {
+      // A new send resets the guard for its own refusal.
+      if (outcome === 'sending' || outcome === 'accepted') lastSent.current = null
+    }
+  })
+
+  const submit = useCallback((): void => {
+    const input = inputRef.current
+    const text = (input?.value ?? draft.current).trim()
+    if (text === '' && imageDraft === null) {
+      input?.focus()
+      return
+    }
+    const prompt = text === '' ? t('action.imageQuestion') : text
+    if (isBusy(state)) {
+      void api.cancel()
+      return
+    }
+    void api.submit(prompt, workspaceChoice, imageDraft ?? undefined)
+    lastSent.current = { text: prompt, image: imageDraft, restored: false }
+    setImageDraft(null)
+    draft.current = ''
+    if (input !== null) input.value = ''
+    onComposerGrow()
+  }, [state, workspaceChoice, imageDraft, t, remeasure])
+
+  const toggleMenu = useCallback((id: string): void => {
+    setOpenMenu(current => (current === id ? null : id))
+  }, [])
+  const closeMenu = useCallback((): void => { setOpenMenu(null) }, [])
+  const toggleSettings = useCallback((): void => {
+    setOpenMenu(null)
+    setPage(current => (current === 'settings' ? 'main' : 'settings'))
+  }, [])
+  const backFromSettings = useCallback((): void => {
+    setPage('main')
+    inputRef.current?.focus()
+  }, [])
+  const chooseWorkspace = useCallback((workspaceId: string): void => {
+    setBrowseChoice(null)
+    // Choosing a workspace while following a conversation is the new-conversation action.
+    if (state.session.following !== null) void api.startNew()
+    setWorkspaceChoice(workspaceId)
+  }, [state.session.following])
+  const chooseUngrouped = useCallback((): void => {
+    setBrowseChoice({ scope: { kind: 'ungrouped' }, sessionId: followingId })
+  }, [followingId])
+  const selectSession = useCallback((sessionId: string): void => {
+    setBrowseChoice(null)
+    void api.selectSession(sessionId)
+  }, [])
+  const toggleFold = useCallback((key: string): void => {
+    setFolds(current => {
+      const next = new Map(current)
+      next.set(key, !(current.get(key) ?? false))
+      return next
+    })
+  }, [])
+  const onDraft = useCallback((text: string): void => { draft.current = text }, [])
+
+  // The composer grew or shrank. Re-measure first (the probe moves the panel's box once more),
+  // then hold the reader at the bottom: the composer's growth comes out of the thread's box
+  // while the panel is capped, and that happens outside React's render cycle — without this the
+  // bottom slipped a line away per keystroke and snapped back on the next render.
+  const onComposerGrow = useCallback((): void => {
+    remeasure()
+    pinToBottom()
+  }, [remeasure])
+
+  const startNew = useCallback((): void => {
+    if (state.session.following !== null) void api.startNew()
+    setImageDraft(null)
+    inputRef.current?.focus()
+  }, [state.session.following])
+  const addImage = useCallback((): void => {
+    imageFileRef.current?.click()
+  }, [])
+  const acceptImage = useCallback((file: File): void => {
+    void readImageFile(file).then(image => {
+      setImageDraft(image)
+      setTransientError(null)
+      onComposerGrow()
+      inputRef.current?.focus()
+    }).catch((error: unknown) => {
+      const reason = error instanceof Error ? error.message : 'read'
+      setTransientError(t(reason === 'type' ? 'action.imageType' : reason === 'size' ? 'action.imageTooLarge' : 'action.imageReadFailed'))
+    })
+  }, [t, onComposerGrow])
+  const removeImage = useCallback((): void => {
+    setImageDraft(null)
+    onComposerGrow()
+    inputRef.current?.focus()
+  }, [onComposerGrow])
+  const openMain = useCallback((): void => {
+    const sessionId = state.session.following?.sessionId ?? null
+    void api.openMain(sessionId, target).then(() => api.setVisible(false)).catch(() => { setTransientError(t('action.openMainFailed')) })
+  }, [state.session.following, target, t])
+  const toggleKeepOpen = useCallback((): void => {
+    void api.setPreferences({ keepOpen: state.settings.hideOnBlur })
+  }, [state.settings.hideOnBlur])
+
+  useGlobalKeys({
+    recording,
+    setRecording,
+    setTransientError,
+    menuOpen: openMenu !== null,
+    closeMenu,
+    settingsOpen: page === 'settings',
+    backFromSettings,
+    hide: flight.requestHide,
+    inputRef,
+    submit,
+  })
+
+  return (
+    <Panel panelRef={panelRef} hiding={flight.hiding} maxHeight={maxHeight}>
+      <TopBar
+        state={state}
+        targetWorkspace={target}
+        scope={scope}
+        openMenu={openMenu}
+        settingsOpen={page === 'settings'}
+        onToggleMenu={toggleMenu}
+        onCloseMenu={closeMenu}
+        onChooseWorkspace={chooseWorkspace}
+        onChooseUngrouped={chooseUngrouped}
+        onSelectSession={selectSession}
+        onToggleSettings={toggleSettings}
+        onHide={flight.requestHide}
+        onStartNew={startNew}
+        onAddImage={addImage}
+        onOpenMain={openMain}
+        onToggleKeepOpen={toggleKeepOpen}
+      />
+      <SettingsPage
+        state={state}
+        hidden={page !== 'settings'}
+        recording={recording}
+        onRecord={() => { setRecording(true) }}
+        onBack={backFromSettings}
+        openMenu={openMenu}
+        onToggleMenu={toggleMenu}
+        onCloseMenu={closeMenu}
+      />
+      <ConversationPage
+        state={state}
+        hidden={page === 'settings'}
+        openMenu={openMenu}
+        onToggleMenu={toggleMenu}
+        onCloseMenu={closeMenu}
+        draft={draft.current}
+        onDraft={onDraft}
+        onSend={submit}
+        onGrow={onComposerGrow}
+        inputRef={inputRef}
+        folds={folds}
+        onToggleFold={toggleFold}
+        onAddImage={addImage}
+        onOpenSettings={toggleSettings}
+        onImage={acceptImage}
+        image={imageDraft}
+        onRemoveImage={removeImage}
+      />
+      <Footer state={state} transientError={transientError} />
+      <input
+        ref={imageFileRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        hidden
+        onChange={event => {
+          const file = event.currentTarget.files?.[0]
+          if (file !== undefined) acceptImage(file)
+          event.currentTarget.value = ''
+        }}
+      />
+    </Panel>
+  )
+}
