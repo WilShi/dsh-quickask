@@ -18,10 +18,17 @@ jobs:
         run: npm install --omit=optional --ignore-scripts
       - name: Install frontend dependencies
         run: npm --prefix quorfloat/frontend ci --ignore-scripts
-      - name: Build Windows package
+      - name: Build Windows npm package
         run: npm run build:npm -- --target x86_64-pc-windows-msvc
-      - name: Upload package
+      - name: Build self-contained Windows package
+        run: npm run build -- --target x86_64-pc-windows-msvc
+      - name: Upload npm package
         uses: actions/upload-artifact@v4
         with:
           name: dsh-quickask-win32-x64
           path: bundles/npm/0.2.0/*.tgz
+      - name: Upload self-contained package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-quickask-win32-self-contained
+          path: bundles/dsh-quickask-0.2.0-win32.tgz
